@@ -32,6 +32,7 @@ from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass, field, fields
 from datetime import datetime, timezone
 from enum import StrEnum
+from typing import TYPE_CHECKING
 from urllib.parse import urljoin, unquote
 import posixpath
 from uuid import UUID
@@ -49,7 +50,12 @@ from watchtower.domain.targets import (
     parse_target,
     parse_url,
 )
-from watchtower.security.destinations import DestinationPolicy
+
+if TYPE_CHECKING:
+    # Imported lazily at runtime (see ScopePolicy.__init__) to avoid a circular
+    # import: security.destinations imports domain.targets, which triggers this
+    # package's __init__ and so this module before destinations finishes loading.
+    from watchtower.security.destinations import DestinationPolicy
 
 
 def utcnow() -> datetime:
@@ -375,10 +381,14 @@ class ScopePolicy:
         if revision is None and denial is None:
             denial = DecisionReason.NO_SCOPE
             denial_detail = denial_detail or "the project has no scope revision"
+        if destinations is None:
+            from watchtower.security.destinations import DestinationPolicy
+
+            destinations = DestinationPolicy()
         self.project_id = project_id
         self.revision = revision
         self.execution_policy = revision.execution_policy if revision else ScopeExecution()
-        self.destinations = destinations or DestinationPolicy()
+        self.destinations = destinations
         self.max_redirects = max_redirects
         self.allow_https_downgrade = allow_https_downgrade
         self._denial = denial
