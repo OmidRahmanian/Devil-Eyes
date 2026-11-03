@@ -1,4 +1,5 @@
 # WatchTower
+<img width="1035" height="554" alt="image" src="https://github.com/user-attachments/assets/26764111-05c5-439a-b324-ef9a253f14f4" />
 
 **Keep watch over your attack surface as it changes.**
 
