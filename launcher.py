@@ -61,8 +61,11 @@ COMPACT_EYE = (
 TAGLINES = ("Always watching.", "See what changes.", "Know your surface.")
 
 
-def banner(stream=None):
-    """Reveal the eye in a live terminal; keep captured output instant and plain."""
+def banner(stream=None, *, tagline=None, colour=None, animate=None):
+    """Reveal the eye in a live terminal; keep captured output instant and plain.
+
+    Returns the tagline shown, so a redrawn header can repeat the same one.
+    """
     stream = sys.stdout if stream is None else stream
     width = min(shutil.get_terminal_size(fallback=(80, 24)).columns, 80)
     eye = EYE
@@ -70,9 +73,12 @@ def banner(stream=None):
         eye = COMPACT_EYE
     if width < max(len(line.replace("|", "")) for line in eye):
         eye = ("<((|@|))>",)
-    colour = stream.isatty() and "NO_COLOR" not in os.environ and os.environ.get("TERM") != "dumb"
+    if colour is None:
+        colour = stream.isatty() and "NO_COLOR" not in os.environ and os.environ.get("TERM") != "dumb"
     grey, red, white, reset = ("\033[90m", "\033[1;31m", "\033[1;37m", "\033[0m") if colour else ("", "", "", "")
-    animate = colour and not any(os.environ.get(key) for key in ("NO_ANIMATION", "REDUCE_MOTION"))
+    if animate is None:
+        animate = colour and not any(os.environ.get(key) for key in ("NO_ANIMATION", "REDUCE_MOTION"))
+    tagline = tagline or random.choice(TAGLINES)
     # 2 = twice the original pace; 0 = instant. Invalid values use the default.
     try:
         speed = float(os.environ.get("DEVILS_EYES_BANNER_SPEED", "2"))
@@ -113,7 +119,7 @@ def banner(stream=None):
         print(reset, file=stream, flush=True)
         if animate:
             time.sleep(0.22 / speed)
-        reveal(centered(random.choice(TAGLINES)), red, step=1, delay=0.025)
+        reveal(centered(tagline), red, step=1, delay=0.025)
         print(reset, file=stream, flush=True)
         subtitle = "Discover. Track. Monitor." if width >= 25 else "Discover. Monitor."
         reveal(centered(subtitle), grey, step=2, delay=0.02)
@@ -124,6 +130,7 @@ def banner(stream=None):
         if animate:
             stream.write(reset + "\033[?25h")
             stream.flush()
+    return tagline
 
 
 def say(message):
@@ -496,12 +503,15 @@ def platform_ready(root, python, env):
         raise RuntimeError("Set WATCHTOWER__DATABASE__URL in .env (see docs/installation.md), then try again.")
 
 
-def platform_wizard(root=ROOT):
-    banner()
+def platform_wizard(root=ROOT, *, no_clear=False):
+    tagline = banner()
     python = python_executable(root)
     env = runtime_environment(root, python)
     platform_ready(root, python, env)
-    return subprocess.run([python, str(root / "terminal_ui.py")], cwd=root, env=env).returncode
+    # Home redraws this banner as its fixed header; keep the same tagline.
+    env["DEVILS_EYES_TAGLINE"] = tagline
+    argv = [python, str(root / "terminal_ui.py"), *(["--no-clear"] if no_clear else [])]
+    return subprocess.run(argv, cwd=root, env=env).returncode
 
 
 def main(argv=None):
@@ -511,20 +521,21 @@ def main(argv=None):
     mode.add_argument("--legacy", action="store_true", help="Use legacy discovery (MongoDB and Subfinder)")
     parser.add_argument("--configure-only", action="store_true", help="Save the legacy setup without starting services")
     parser.add_argument("--banner", action="store_true", help="Preview the Devils Eyes banner without changing configuration")
+    parser.add_argument("--no-clear", action="store_true", help="Print platform screens one after another instead of redrawing in place")
     args = parser.parse_args(argv)
     try:
         if args.banner:
             banner()
             return 0
         if args.platform:
-            return platform_wizard()
+            return platform_wizard(no_clear=args.no_clear)
         if args.legacy or args.configure_only:
             return wizard(configure_only=args.configure_only)
         if choose("How do you want to run Devils Eyes?", {
             "1": "Platform: authorized scope, runs, findings and dashboard (PostgreSQL)",
             "2": "Legacy discovery: Subfinder with MongoDB",
         }) == "1":
-            return platform_wizard()
+            return platform_wizard(no_clear=args.no_clear)
         return wizard()
     except (KeyboardInterrupt, EOFError):
         say("\nDevils Eyes stopped.")

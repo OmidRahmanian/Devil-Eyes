@@ -19,7 +19,15 @@ DEVILS_EYES_BANNER_SPEED=0 python launcher.py --platform  # instant
 Use `export DEVILS_EYES_BANNER_SPEED=4` to keep that pace for the current
 terminal session. Reduced-motion and no-animation settings still take priority.
 
-The large banner appears once. Choose an accessible project by number. Use
+The banner animates once, then stays at the top of the terminal with the
+project, database, scope and latest-run status beneath it. Each menu choice
+replaces the screen below that header in place, so earlier menus do not pile up
+in the scrollback; messages and errors appear above the current menu, and scan
+progress refreshes in the same spot. Short terminals switch to a one-line
+header. Piped output, `TERM=dumb` and `python launcher.py --platform --no-clear`
+print screens one after another instead.
+
+Choose an accessible project by number. Use
 **Create project** for a new project, **Use another token file** for existing
 credentials, or **Change profile** for Development, Lab or Production. Creating
 a project needs the configured database access; it does not publish scope or
@@ -68,6 +76,12 @@ new target**, and **Choose another saved target / project** in the same flow.
 New targets added alongside an existing scope get a separate project and token
 automatically, preserving the previous target's scope, exclusions and history.
 Saved scans reuse their existing authorization and scan only the selected root.
+All choices in Start scan use numbers. If a scan is already queued or running,
+Start scan offers **Continue** for that saved run, **Add a new target**, and
+**Choose another saved target**. Continue opens the processing/progress window
+for the same run rather than queueing a duplicate. A queued run waiting for a
+worker can therefore be started directly from option 1. Adding another target
+keeps the unfinished scan and its original target settings intact.
 
 On WSL, Windows opens a separate terminal for scan progress, leaving Home
 available. On macOS and other Linux installations a separate terminal is also

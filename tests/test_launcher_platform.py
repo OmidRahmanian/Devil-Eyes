@@ -30,6 +30,16 @@ class PlatformLauncherTests(unittest.TestCase):
         self.assertEqual(args[-1], str(self.root / "terminal_ui.py"))
         self.assertNotIn("private-database-url", " ".join(args))
         self.assertEqual(run.call_args.kwargs["env"], environment)
+        # Home redraws the banner it just showed as its fixed header.
+        self.assertIn(environment["DEVILS_EYES_TAGLINE"], self.output.getvalue())
+
+    def test_no_clear_is_passed_to_home(self):
+        with contextlib.redirect_stdout(self.output), \
+                patch.object(launcher, "runtime_environment", return_value={}), \
+                patch.object(launcher, "platform_ready"), \
+                patch.object(launcher.subprocess, "run", return_value=Mock(returncode=0)) as run:
+            launcher.platform_wizard(self.root, no_clear=True)
+        self.assertEqual(run.call_args.args[0][-2:], [str(self.root / "terminal_ui.py"), "--no-clear"])
 
     def test_platform_dependency_failure_does_not_open_home(self):
         with contextlib.redirect_stdout(self.output), \

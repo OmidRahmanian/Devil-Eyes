@@ -12,9 +12,11 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 import fcntl
 import hashlib
+import io
 import json
 import os
 from pathlib import Path
+import random
 import shlex
 import shutil
 import signal
@@ -52,26 +54,179 @@ class Back(Exception):
     pass
 
 
+class Screen:
+    """A fixed banner and status header above a content area that is redrawn in place.
+
+    Only a live terminal is redrawn; pipes, TERM=dumb and --no-clear keep plain
+    sequential output. Content lines are already escaped and bounded by tell().
+    """
+    def __init__(self):
+        self.enabled = False
+        self.status = []
+        self.lines = []        # content shown since the user last moved to another screen
+        self.stale = True      # the terminal does not show self.lines yet
+        self.holding = False
+        self.prompting = False
+        self.tagline = None
+        self.output = None
+
+    @property
+    def stream(self):
+        return self.output or sys.stdout
+
+    def start(self, *, no_clear=False, stream=None):
+        self.output = stream
+        self.enabled = not no_clear and self.stream.isatty() and os.environ.get("TERM") != "dumb"
+        tagline = os.environ.get("DEVILS_EYES_TAGLINE")
+        self.tagline = tagline if tagline in launcher.TAGLINES else random.choice(launcher.TAGLINES)
+
+    def note(self, text):
+        if not self.enabled:
+            print(text, file=self.stream, flush=True)
+            return
+        self.lines.append(text)
+        if self.holding:
+            return
+        if self.stale:
+            self.render()
+        else:
+            print(text, file=self.stream, flush=True)
+        self.prompting = False
+
+    def record(self, text):
+        """Keep an answered prompt on screen when the content is redrawn."""
+        if self.enabled:
+            self.lines.append(safe(text)[:4000])
+
+    def show_status(self, lines):
+        if not self.enabled:
+            tell()
+            for line in lines:
+                tell(line)
+            return
+        self.status = [safe(line)[:4000] for line in lines]
+
+    def page(self):
+        """The user moved to another screen: its output replaces this content."""
+        self.lines = []
+        self.stale = True
+
+    def invalidate(self):
+        """Another process drew on this terminal."""
+        self.stale = True
+
+    def mark(self):
+        return len(self.lines)
+
+    @contextmanager
+    def frame(self, mark):
+        """Replace the content after mark with the block's output, drawn at once."""
+        if not self.enabled:
+            yield
+            return
+        del self.lines[mark:]
+        self.holding = True
+        try:
+            yield
+        finally:
+            self.holding = False
+        self.render()
+
+    def header(self, width, room):
+        colour = "NO_COLOR" not in os.environ
+        red, reset = ("\033[1;31m", "\033[0m") if colour else ("", "")
+        status = [part for line in self.status for part in textwrap.wrap(line, width) or [""]]
+        banner = io.StringIO()
+        launcher.banner(banner, tagline=self.tagline, colour=colour, animate=False)
+        eye = banner.getvalue().split("\n")[:-1]
+        if len(eye) + len(status) + 2 <= room:
+            return [*eye, *([""] + status if status else []), ""]
+        # Too short for the eye: one compact line keeps the brand and status visible.
+        compact = " | ".join(self.status or ["DEVILS EYES"])
+        return [*textwrap.wrap(compact, width), red + "-" * min(width, 76) + reset, ""]
+
+    def render(self, extra=()):
+        if not self.enabled:
+            return
+        size = shutil.get_terminal_size((80, 24))
+        width = max(20, min(size.columns, 120))
+        body = [part for line in (*self.lines, *extra) for part in str(line).split("\n")]
+        while body and not body[0]:
+            body.pop(0)
+        rows = self.header(width, size.lines - len(body) - 1) + body
+        # Home and overwrite each row, then clear below and the scrollback:
+        # no flicker on live refresh and no stacked copies of earlier screens.
+        self.stream.write("\033[H\033[3J" + "".join(row + "\033[K\n" for row in rows) + "\033[J")
+        self.stream.flush()
+        self.stale = False
+
+    def close(self):
+        if self.enabled:
+            self.stream.write("\033[0m" + ("\n" if self.prompting else ""))
+            self.stream.flush()
+
+
+SCREEN = Screen()
+
+
 def tell(value=""):
     """Bound and wrap untrusted data; never interpret terminal control sequences."""
     width = max(20, min(shutil.get_terminal_size((80, 24)).columns, 120))
     for line in str(value).split("\n"):
-        print(textwrap.fill(safe(line)[:4000], width=width, replace_whitespace=False) or "", flush=True)
+        SCREEN.note(textwrap.fill(safe(line)[:4000], width=width, replace_whitespace=False) or "")
+
+
+def prompt(label, default, check, below=()):
+    """Ask until check accepts. A live terminal redraws the same screen with the error."""
+    error = None
+    while True:
+        if SCREEN.enabled and (error or below or SCREEN.stale):
+            SCREEN.render([*([error] if error else []), *below])
+        SCREEN.prompting = True
+        answer = launcher.ask(label, default)
+        SCREEN.prompting = False
+        try:
+            value = check(answer)
+        except ValueError as exc:
+            if not SCREEN.enabled:
+                tell(exc)
+            error = safe(str(exc))
+            continue
+        SCREEN.record(label + (" [" + default + "]" if default else "") + ": " + answer)
+        return value
 
 
 def field(label, default="", validate=None):
-    while True:
-        answer = launcher.ask(label + " (b: Back)", default)
+    def check(answer):
         if answer.lower() == "b":
             raise Back()
-        try:
-            return validate(answer) if validate else answer
-        except ValueError as exc:
-            tell(exc)
+        return validate(answer) if validate else answer
+    return prompt(label + " (b: Back)", default, check)
+
+
+def yes_no(question, default=True):
+    if not SCREEN.enabled:
+        return launcher.yes_no(question, default)
+
+    def check(answer):
+        if answer.lower() not in ("y", "yes", "n", "no"):
+            raise ValueError("Please enter y or n.")
+        return answer.lower() in ("y", "yes")
+    return prompt(question + (" (Y/n)" if default else " (y/N)"), "y" if default else "n", check)
 
 
 def menu(label, options, default="0"):
-    return launcher.choose(label, options, default)
+    if not SCREEN.enabled:
+        return launcher.choose(label, options, default)
+
+    def check(answer):
+        if answer not in options:
+            raise ValueError("Please choose one of the listed numbers.")
+        return answer
+    lines = ["", safe(label), *(f"  {key}) {safe(text)}" for key, text in options.items())]
+    answer = prompt("Choose", default, check, below=lines)
+    SCREEN.page()
+    return answer
 
 
 class Preferences:
@@ -238,7 +393,7 @@ def render_progress(detail, project):
     elapsed = max(0, int((datetime.fromisoformat(end) - datetime.fromisoformat(run["created_at"])).total_seconds()))
     tell(f"\n{project} | Run {run['run_id']} | Elapsed {elapsed // 60}m {elapsed % 60}s")
     style = Style(sys.stdout)
-    print(style(run["status"].upper(), RUN_COLOURS.get(run["status"], "bold")), flush=True)
+    SCREEN.note(style(run["status"].upper(), RUN_COLOURS.get(run["status"], "bold")))
     tell("Discovery > DNS > HTTP > Checks > Finalize")
     tell("Current: " + ("finished" if run["status"] in FINISHED else current_phase(detail)))
     for phase in PHASES:
@@ -331,12 +486,15 @@ def watch_run(client, run_id, *, work=False, interval=2):
             tell("Local worker enabled: it may also process due jobs and notifications from other projects.")
             processor = LocalProcessor(client)
             processor.start()
+        mark = SCREEN.mark()
         while True:
             detail = client.json("run", "show", run_id)
             signature = json.dumps(detail, sort_keys=True)
             now = time.monotonic()
-            if signature != previous or now - last_print >= 30:
-                render_progress(detail, client.project)
+            # A redrawn screen refreshes in place on every poll, so elapsed time keeps moving.
+            if SCREEN.enabled or signature != previous or now - last_print >= 30:
+                with SCREEN.frame(mark):
+                    render_progress(detail, client.project)
                 previous, last_print = signature, now
             status = detail["run"]["status"]
             if status in FINISHED:
@@ -378,6 +536,8 @@ def process_here(client, run_id):
                 process.kill()
                 process.wait()
                 raise UiError("Worker shutdown timed out. Resume the existing run after its leases expire.") from None
+    finally:
+        SCREEN.invalidate()
 
 
 def launch_scan(client, run_id):
@@ -423,14 +583,14 @@ def saved_roots(status):
     return sorted(roots)
 
 
-def add_scan_target(client, status, preferences):
+def add_scan_target(client, status, preferences, *, separate=False):
     """Collect and confirm a target before saving anything or queueing a run."""
     tell("\nAdd a target")
     tell("Paste a root domain or website link. The hostname is used; URL paths are not scan boundaries.")
     domain = field("Domain or website link", validate=target_domain)
     tell("Target: " + domain)
     include = [domain]
-    if launcher.yes_no("Discover and scan ALL subdomains (*." + domain + ") too?", default=False):
+    if yes_no("Discover and scan ALL subdomains (*." + domain + ") too?", default=False):
         include.append("*." + domain)
     excluded = field("Subdomains to skip (Enter: none)", "-", lambda value: launcher.exclusions(value, domain))
     choice = menu("Permission to scan", {**{k: label for k, (_, label) in launcher.AUTHORIZATIONS.items()}, "0": "Back"})
@@ -446,9 +606,9 @@ def add_scan_target(client, status, preferences):
     tell("\nScan: " + ", ".join(include))
     tell("Skip: " + (", ".join(excluded) or "none"))
     tell("This discovers subdomains, resolves DNS, probes websites and runs approved checks.")
-    if not launcher.yes_no("Confirm you are authorized for these targets, save and start the scan?", default=False):
+    if not yes_no("Confirm you are authorized for these targets, save and start the scan?", default=False):
         raise Back()
-    if status.get("scope"):
+    if status.get("scope") or separate:
         # A separate project preserves the previous target's policy and history.
         slug = launcher.project_slug(domain.replace(".", "-")[:50]) + "-" + uuid4().hex[:8]
         directory = preferences.directory / "tokens"
@@ -470,44 +630,62 @@ def add_scan_target(client, status, preferences):
 
 
 def active_scan(client):
-    active = [r for r in client.json("run", "list", "--limit", "200") if r["status"] not in FINISHED]
-    if active:
-        tell("A run is already active. View or resume it instead of queueing a duplicate:")
-        for run in active:
-            tell(f"  {run['run_id']} {run['status']}")
-    return bool(active)
+    return [r for r in client.json("run", "list", "--limit", "200") if r["status"] not in FINISHED]
 
 
 def start_scan(client, preferences=None):
     preferences = preferences or Preferences(client.root)
-    if active_scan(client):
-        return client
-    status = client.json("status")
-    roots = saved_roots(status)
-    if status.get("scope"):
-        options = {str(i): domain for i, domain in enumerate(roots, 1)}
-        action = menu("What would you like to scan?", {**options, "n": "Add a new target",
-                      "s": "Choose another saved target / project", "0": "Back"}, "1" if roots else "n")
+    active = active_scan(client)
+    add_new = False
+    if active:
+        tell("You have an unfinished scan. Continue it here, or add another target.")
+        options = {}
+        for i, run in enumerate(active, 1):
+            targets = ", ".join(run.get("targets") or [client.project])
+            state = "waiting to start" if run["status"] == "queued" else run["status"]
+            options[str(i)] = f"Continue {targets} ({state}, {run['run_id'][:8]})"
+        new_choice, saved_choice = str(len(active) + 1), str(len(active) + 2)
+        action = menu("Start scan", {**options, new_choice: "Add a new target",
+                      saved_choice: "Choose another saved target", "0": "Back"}, "1")
         if action == "0":
             return client
-        if action == "s":
+        if action == saved_choice:
             return start_scan(select_project(client, preferences), preferences)
-        if action == "n":
+        if action != new_choice:
+            run = active[int(action) - 1]
+            tell("Continuing your saved scan " + run["run_id"] + ".")
+            launch_scan(client, run["run_id"])
+            return client
+        add_new = True
+    status = client.json("status")
+    roots = saved_roots(status)
+    if add_new:
+        client, target = add_scan_target(client, status, preferences, separate=True)
+    elif status.get("scope"):
+        options = {str(i): domain for i, domain in enumerate(roots, 1)}
+        new_choice, saved_choice = str(len(roots) + 1), str(len(roots) + 2)
+        action = menu("What would you like to scan?", {**options, new_choice: "Add a new target",
+                      saved_choice: "Choose another saved target", "0": "Back"}, "1" if roots else new_choice)
+        if action == "0":
+            return client
+        if action == saved_choice:
+            return start_scan(select_project(client, preferences), preferences)
+        if action == new_choice:
             client, target = add_scan_target(client, status, preferences)
         else:
             target = roots[int(action) - 1]
             tell("Target: " + target + " | Saved permissions and exclusions apply.")
-            if not launcher.yes_no("Start scan?", default=False):
+            if not yes_no("Start scan?", default=False):
                 return client
     else:
         client, target = add_scan_target(client, status, preferences)
     # Recheck after the wizard, under the launch lock, in case another window queued work.
     with session_lock(client, "start"):
-        if active_scan(client):
-            return client
-        run = client.json("run", "start", "--target", target, "--reason", "started from terminal home", "--reuse-active",
-                          "--idempotency-key", str(uuid4()))
-    tell("Queued run " + run["run_id"])
+        existing = next((r for r in active_scan(client)
+                         if r.get("kind") == "scan" and r.get("targets") == [target]), None)
+        run = existing or client.json("run", "start", "--target", target, "--reason", "started from terminal home", "--reuse-active",
+                                      "--idempotency-key", str(uuid4()))
+    tell(("Continuing your saved scan " if existing else "Queued run ") + run["run_id"])
     launch_scan(client, run["run_id"])
     return client
 
@@ -537,7 +715,7 @@ def progress_menu(client):
             watch_run(client, run["run_id"])
         elif action == "3":
             launch_scan(client, run["run_id"])
-        elif launcher.yes_no("Cancel this run?", default=False):
+        elif yes_no("Cancel this run?", default=False):
             reason = field("Cancellation reason", validate=launcher.required_text)
             client.show("run", "cancel", run["run_id"], "--reason", reason)
 
@@ -554,12 +732,12 @@ def manage_scope(client):
             client.show("scope", "check", field("Target to check", validate=launcher.required_text))
         elif action == "4":
             current = client.json("status").get("scope")
-            if current and launcher.yes_no("Revoke current scope and stop authorization for new requests?", default=False):
+            if current and yes_no("Revoke current scope and stop authorization for new requests?", default=False):
                 client.show("scope", "revoke", current["id"], "--reason", field("Reason", validate=launcher.required_text))
         else:
             domain = field("Target domain (text, e.g. example.com)", validate=launcher.domain_name)
             include = [domain]
-            if launcher.yes_no("Also include ALL subdomains (*." + domain + ")?", default=False):
+            if yes_no("Also include ALL subdomains (*." + domain + ")?", default=False):
                 include.append("*." + domain)
             excluded = field("Excluded exact subdomains, comma-separated (- for none)", "-",
                              lambda value: launcher.exclusions(value, domain))
@@ -570,7 +748,7 @@ def manage_scope(client):
             reference = field("Authorization reference (policy URL, contract or ticket)", validate=launcher.required_text)
             granted = field("Person or organization granting permission", validate=launcher.required_text)
             tell("New scope: " + ", ".join(include) + "; excluded: " + (", ".join(excluded) or "none"))
-            if not launcher.yes_no("Do you have authorization covering every included target?", default=False):
+            if not yes_no("Do you have authorization covering every included target?", default=False):
                 tell("Cancelled. Scope unchanged.")
                 continue
             args = ["scope", "publish", "--authorization-kind", kind, "--reference", reference,
@@ -593,7 +771,7 @@ def browse_findings(client):
         if action == "1":
             client.show("finding", "show", finding)
         elif action == "2":
-            if launcher.yes_no("Queue a retest? It needs a worker; this does not mark the finding fixed.", default=False):
+            if yes_no("Queue a retest? It needs a worker; this does not mark the finding fixed.", default=False):
                 client.show("finding", "retest", finding)
                 tell("Use View scan progress to open the retest's processing window.")
         elif action == "4":
@@ -606,7 +784,7 @@ def browse_findings(client):
             if status != "0":
                 value = {"1": "open", "2": "triaged", "3": "accepted_risk", "4": "false_positive", "5": "in_progress"}[status]
                 reason = field("Reason", validate=launcher.required_text)
-                if launcher.yes_no("Set this finding to " + value + "?", default=False):
+                if yes_no("Set this finding to " + value + "?", default=False):
                     client.show("finding", "triage", finding, "--status", value, "--reason", reason)
 
 
@@ -725,7 +903,7 @@ def select_project(client, preferences):
         elif action == "c":
             slug = field("New project NAME (text, e.g. acme-lab)", validate=launcher.project_slug)
             owner = field("Your name", validate=launcher.required_text)
-            if not launcher.yes_no("Create this project using your configured database access?", default=False):
+            if not yes_no("Create this project using your configured database access?", default=False):
                 continue
             directory = preferences.directory / "tokens"
             directory.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -791,21 +969,21 @@ def home(root=ROOT):
             return 0
     while True:
         try:
-            tell("\nDEVILS EYES | Platform")
-            tell(f"Project: {client.project} | Profile: {client.profile}")
+            lines = ["DEVILS EYES | Platform", f"Project: {client.project} | Profile: {client.profile}"]
             try:
                 status = client.json("status")
-                tell("Database: Connected | Scope: " + scope_summary(status))
+                lines.append("Database: Connected | Scope: " + scope_summary(status))
                 runs = client.json("run", "list", "--limit", "1")
                 if runs:
                     detail = client.json("run", "show", runs[0]["run_id"])
-                    tell("Latest run: " + runs[0]["status"].upper() + " / " +
-                         ("finished" if runs[0]["status"] in FINISHED else current_phase(detail)))
+                    lines.append("Latest run: " + runs[0]["status"].upper() + " / " +
+                                 ("finished" if runs[0]["status"] in FINISHED else current_phase(detail)))
                 else:
-                    tell("Latest run: none")
+                    lines.append("Latest run: none")
             except UiError as exc:
-                tell("Connection / access unavailable: " + str(exc))
-                tell("Retry after checking .env and PostgreSQL, or switch project through option 8.")
+                lines.append("Connection / access unavailable: " + str(exc))
+                lines.append("Retry after checking .env and PostgreSQL, or switch project through option 8.")
+            SCREEN.show_status(lines)
             action = menu("Home", HOME)
             if action == "0":
                 return 0
@@ -847,7 +1025,11 @@ def main(argv=None):
     mode.add_argument("--dashboard", action="store_true")
     parser.add_argument("--open-browser", action="store_true", help="Open the dashboard after its server is ready")
     parser.add_argument("--hold", action="store_true")
+    parser.add_argument("--no-clear", action="store_true", help="Print screens one after another instead of redrawing in place")
     args = parser.parse_args(argv)
+    # The dashboard window streams server logs, so it is never redrawn.
+    if not args.dashboard:
+        SCREEN.start(no_clear=args.no_clear)
     # Terminal close and termination get the same cleanup path as Ctrl+C.
     def interrupted(signum, frame):
         raise KeyboardInterrupt()
@@ -866,6 +1048,7 @@ def main(argv=None):
             if args.dashboard:
                 code = serve_dashboard(client, browse=args.open_browser)
             else:
+                SCREEN.status = ["DEVILS EYES | Scan progress", f"Project: {safe(client.project)} | Profile: {client.profile}"]
                 code = scan_window(client, args.run)
         else:
             code = home()
@@ -875,6 +1058,7 @@ def main(argv=None):
         tell(str(exc) if isinstance(exc, UiError) else "Could not continue. Check configuration and local tools.")
         code = 1
     finally:
+        SCREEN.close()
         if args.hold:
             try:
                 input("\nSession ended. Press Enter to close this window. ")
