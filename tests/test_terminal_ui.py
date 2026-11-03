@@ -1,4 +1,5 @@
 """Terminal UX and process boundaries: never launch terminals or outbound scans."""
+from datetime import datetime, timedelta, timezone
 import io
 import os
 import base64
@@ -629,12 +630,13 @@ def home_data(tmp_path, client, monkeypatch):
 
 def test_live_home_submenu_and_back_replace_the_content_under_a_fixed_header(client, tmp_path, monkeypatch, live):
     home_data(tmp_path, client, monkeypatch)
-    answers = iter(["1", "0", "0"])
+    answers = iter(["1", "1", "0", "0"])
     monkeypatch.setattr("builtins.input", lambda prompt: next(answers))
     assert ui.home(tmp_path) == 0
     # A message drawn before its menu adds an in-place frame; compare the menu screens.
-    home, start, back = [frame for frame in live() if "0) " in frame]
-    for frame in (home, start, back):
+    home, kind, start, back = [frame for frame in live() if "0) " in frame]
+    assert "1) Scan once" in kind and "2) Continuous monitoring" in kind and "Browse inventory" not in kind
+    for frame in (home, kind, start, back):
         assert frame.count("DEVILS EYES | Platform") == 1 and frame.count("See what changes.") == 1
         assert frame.index("Discover. Track. Monitor.") < frame.index("Latest run: QUEUED")
     assert "Browse inventory" not in start and "Continue acme.example" in start
@@ -701,10 +703,371 @@ def test_pipes_no_clear_and_dumb_terminals_keep_sequential_output(client, tmp_pa
     monkeypatch.setenv("TERM", term)
     monkeypatch.setattr(ui, "SCREEN", ui.Screen())
     ui.SCREEN.start(no_clear=no_clear)
-    answers = iter(["1", "0", "0"])
+    answers = iter(["1", "1", "0", "0"])
     monkeypatch.setattr("builtins.input", lambda prompt: next(answers))
     assert ui.home(tmp_path) == 0
     text = output.getvalue()
     assert "\033[H" not in text and "\033[3J" not in text
     assert text.count("DEVILS EYES | Platform") == 2 and text.count("1) Start scan") == 2
     assert text.index("Continue acme.example") < text.rindex("1) Start scan")
+
+
+# -- Continuous monitoring ------------------------------------------------------
+
+START = datetime(2026, 11, 3, 6, 0, tzinfo=timezone.utc)
+
+
+class FakeCli:
+    """Runs in memory; repeated idempotency keys return the same run, like the CLI."""
+    def __init__(self, roots=("acme.example",)):
+        self.roots = list(roots)
+        self.runs = []
+        self.keys = {}
+        self.cancelled = []
+
+    def __call__(self, client, *args):
+        if args == ("status",):
+            return {"scope": {"rules": [{"effect": "include", "pattern": root} for root in self.roots]}}
+        if args[:2] == ("run", "list"):
+            return list(reversed(self.runs))
+        if args[:2] == ("run", "show"):
+            return {"run": next(r for r in self.runs if r["run_id"] == args[2]), "jobs": []}
+        if args[:2] == ("run", "start"):
+            key = args[args.index("--idempotency-key") + 1]
+            if key not in self.keys:
+                targets = [args[i + 1] for i, arg in enumerate(args) if arg == "--target"] or self.roots
+                self.keys[key] = {"run_id": str(uuid4()), "kind": "scan", "status": "queued", "targets": targets,
+                                  "created_at": START.isoformat(), "finished_at": None, "project": client.project}
+                self.runs.append(self.keys[key])
+            return self.keys[key]
+        raise AssertionError(args)
+
+    def finish(self, status="succeeded"):
+        for run in self.runs:
+            if run["status"] not in ui.FINISHED:
+                run.update(status=status, finished_at=START.isoformat())
+
+
+@pytest.fixture
+def cli(monkeypatch):
+    fake = FakeCli()
+    monkeypatch.setattr(ui.Client, "json", lambda self, *args: fake(self, *args))
+    monkeypatch.setattr(ui.Client, "show", lambda self, *args: fake.cancelled.append(args))
+    return fake
+
+
+def plan(client, *, interval=6 * 3600, state="active", targets=("acme.example",)):
+    return {"id": str(uuid4()), "state": state, "interval": interval, "watches": [
+        {"project": client.project, "token_file": str(client.token_file), "targets": list(targets),
+         "label": ", ".join(targets) or "acme.example"}]}
+
+
+def monitor_at(client, store, clock):
+    return ui.Monitor(client, store, clock=lambda: clock["now"])
+
+
+@pytest.mark.parametrize("value, seconds", [("90m", 5400), ("8h", 28800), ("2d", 172800), (" 15M ", 900)])
+def test_custom_interval_accepts_minutes_hours_and_days(value, seconds):
+    assert ui.interval_seconds(value) == seconds
+
+
+@pytest.mark.parametrize("value", ["5m", "31d", "six hours", "6", "-1h"])
+def test_custom_interval_rejects_unclear_or_extreme_values(value):
+    with pytest.raises(ValueError):
+        ui.interval_seconds(value)
+
+
+@pytest.mark.parametrize("seconds, text", [(3600, "1 hour"), (86400, "24 hours"), (5400, "90 minutes"), (172800, "2 days")])
+def test_intervals_are_described_in_plain_words(seconds, text):
+    assert ui.describe_interval(seconds) == text
+
+
+def test_start_scan_offers_scan_once_or_continuous_monitoring(client, tmp_path, monkeypatch, capsys):
+    home_data(tmp_path, client, monkeypatch)
+    once, monitoring = Mock(side_effect=lambda c, p: c), Mock(side_effect=lambda c, p: c)
+    monkeypatch.setattr(ui, "start_scan", once)
+    monkeypatch.setattr(ui, "monitoring_menu", monitoring)
+    answers = iter(["1", "1", "1", "2", "1", "0", "0"])
+    monkeypatch.setattr("builtins.input", lambda prompt: next(answers))
+    assert ui.home(tmp_path) == 0
+    assert once.call_count == 1 and monitoring.call_count == 1
+    assert "1) Scan once" in capsys.readouterr().out
+
+
+def test_monitoring_defaults_to_the_selected_target_every_six_hours(client, cli, monkeypatch, capsys):
+    opened = Mock()
+    monkeypatch.setattr(ui, "open_window", opened)
+    answers = iter(["", "", "", "y"])
+    monkeypatch.setattr("builtins.input", lambda prompt: next(answers))
+    store = ui.MonitorStore(client.root, client.profile)
+    ui.monitoring_menu(client, ui.Preferences(client.root))
+    saved = store.plan()
+    assert saved["interval"] == 6 * 3600 and saved["state"] == "active"
+    assert [(w["project"], w["targets"]) for w in saved["watches"]] == [("acme", ["acme.example"])]
+    opened.assert_called_once_with(client, monitor=True)
+    out = " ".join(capsys.readouterr().out.split())
+    assert "Only acme.example (recommended)" in out and "6 hours (default)" in out
+    assert "computer is awake" in out and "keeps a running scan" in out
+    assert not cli.runs  # the monitoring window starts the first scan, not Home
+
+
+def test_all_projects_needs_an_explicit_confirmation(client, cli, monkeypatch, capsys):
+    monkeypatch.setattr(ui, "all_watches", lambda c, p: [
+        {"project": "acme", "token_file": "t1", "targets": [], "label": "acme.example"},
+        {"project": "beta", "token_file": "t2", "targets": [], "label": "beta.example"}])
+    monkeypatch.setattr(ui, "open_window", Mock())
+    answers = iter(["", "2", "n"])
+    monkeypatch.setattr("builtins.input", lambda prompt: next(answers))
+    store = ui.MonitorStore(client.root, client.profile)
+    with pytest.raises(ui.Back):
+        ui.monitoring_menu(client, ui.Preferences(client.root))
+    assert not store.plan() and "beta.example (project beta)" in capsys.readouterr().out
+    answers = iter(["", "2", "y", "", "y"])
+    ui.monitoring_menu(client, ui.Preferences(client.root))
+    assert [w["project"] for w in store.plan()["watches"]] == ["acme", "beta"]
+
+
+def test_custom_interval_is_saved(client, cli, monkeypatch):
+    monkeypatch.setattr(ui, "open_window", Mock())
+    answers = iter(["", "", "6", "10m", "90m", "y"])
+    monkeypatch.setattr("builtins.input", lambda prompt: next(answers))
+    ui.monitoring_menu(client, ui.Preferences(client.root))
+    assert ui.MonitorStore(client.root, client.profile).plan()["interval"] == 5400
+
+
+def test_first_scan_starts_now_then_repeats_only_after_the_interval(client, cli):
+    store = ui.MonitorStore(client.root, client.profile)
+    saved = plan(client)
+    clock = {"now": START}
+    monitor = monitor_at(client, store, clock)
+    progress = store.progress(saved)
+    monitor.tick(saved, progress)
+    assert len(cli.runs) == 1 and cli.runs[0]["targets"] == ["acme.example"]
+    cli.finish()
+    clock["now"] = START + timedelta(hours=5, minutes=59)
+    monitor.tick(saved, progress)
+    assert len(cli.runs) == 1
+    clock["now"] = START + timedelta(hours=6)
+    lines = ui.monitoring_lines(saved, monitor.tick(saved, progress), clock["now"], True)
+    assert len(cli.runs) == 2 and len(cli.keys) == 2
+    assert any("Current scan: QUEUED" in line for line in lines)
+    assert any("Last scan: SUCCEEDED" in line for line in lines)
+
+
+def test_a_running_scan_is_never_overlapped(client, cli):
+    store = ui.MonitorStore(client.root, client.profile)
+    saved = plan(client)
+    clock = {"now": START}
+    monitor = monitor_at(client, store, clock)
+    progress = store.progress(saved)
+    monitor.tick(saved, progress)
+    clock["now"] = START + timedelta(hours=7)
+    views = monitor.tick(saved, progress)
+    assert len(cli.runs) == 1
+    assert "  Next scan: after the current scan finishes" in ui.monitoring_lines(saved, views, clock["now"], True)
+    cli.finish()
+    monitor.tick(saved, progress)
+    assert len(cli.runs) == 2
+
+
+def test_a_manual_scan_of_the_same_target_also_blocks_overlap(client, cli):
+    cli.runs.append({"run_id": str(uuid4()), "kind": "scan", "status": "running", "targets": ["acme.example"],
+                     "created_at": START.isoformat(), "finished_at": None})
+    store = ui.MonitorStore(client.root, client.profile)
+    saved = plan(client)
+    monitor_at(client, store, {"now": START}).tick(saved, store.progress(saved))
+    assert len(cli.runs) == 1 and not cli.keys
+
+
+def test_restart_after_a_crash_reuses_the_same_scan(client, cli):
+    store = ui.MonitorStore(client.root, client.profile)
+    saved = plan(client)
+    first = monitor_at(client, store, {"now": START})
+    first.tick(saved, store.progress(saved))
+    store.progress_path.unlink()  # the crash lost the saved progress after the run was queued
+    cli.finish()
+    monitor_at(client, store, {"now": START}).tick(saved, store.progress(saved))
+    assert len(cli.runs) == 1
+
+
+def test_missed_intervals_start_one_scan_on_resume(client, cli):
+    store = ui.MonitorStore(client.root, client.profile)
+    saved = plan(client, interval=3600)
+    clock = {"now": START}
+    monitor = monitor_at(client, store, clock)
+    progress = store.progress(saved)
+    monitor.tick(saved, progress)
+    cli.finish()
+    clock["now"] = START + timedelta(days=2)  # the computer slept through 47 intervals
+    monitor.tick(saved, progress)
+    monitor.tick(saved, progress)
+    assert len(cli.runs) == 2
+
+
+def test_paused_monitoring_starts_nothing(client, cli):
+    store = ui.MonitorStore(client.root, client.profile)
+    saved = plan(client, state="paused")
+    views = monitor_at(client, store, {"now": START}).tick(saved, store.progress(saved))
+    assert not cli.runs
+    assert "  Next scan: paused" in ui.monitoring_lines(saved, views, START, True)
+
+
+def test_whole_scope_watch_scans_every_root_without_naming_targets(client, cli):
+    cli.roots = ["acme.example", "beta.example"]
+    store = ui.MonitorStore(client.root, client.profile)
+    saved = plan(client, targets=())
+    monitor_at(client, store, {"now": START}).tick(saved, store.progress(saved))
+    assert cli.runs[0]["targets"] == ["acme.example", "beta.example"]
+
+
+def test_failed_start_is_reported_and_retried_without_advancing(client, cli, monkeypatch):
+    store = ui.MonitorStore(client.root, client.profile)
+    saved = plan(client)
+    monitor = monitor_at(client, store, {"now": START})
+    progress = store.progress(saved)
+    real = ui.Client.json
+    monkeypatch.setattr(ui.Client, "json", lambda self, *args: (_ for _ in ()).throw(ui.UiError("watchtower: scope violation"))
+                        if args[:2] == ("run", "start") else real(self, *args))
+    lines = ui.monitoring_lines(saved, monitor.tick(saved, progress), START, True)
+    assert "  Problem: watchtower: scope violation" in lines and not cli.runs
+    monkeypatch.setattr(ui.Client, "json", real)
+    monitor.tick(saved, progress)
+    assert len(cli.runs) == 1 and "error" not in progress["watches"]["acme:acme.example"]
+
+
+def test_only_one_monitoring_window_runs_per_profile(client):
+    store = ui.MonitorStore(client.root, client.profile)
+    assert not store.running()
+    with store.hold():
+        assert store.running()
+        with pytest.raises(ui.UiError, match="already running"):
+            with ui.MonitorStore(client.root, client.profile).hold():
+                pass
+    assert not store.running()
+
+
+def test_home_status_shows_a_closed_monitoring_window(client, cli):
+    store = ui.MonitorStore(client.root, client.profile)
+    assert ui.monitoring_status(client) is None
+    store.save_plan(plan(client))
+    assert "NOT RUNNING" in ui.monitoring_status(client)
+    with store.hold():
+        assert ui.monitoring_status(client).startswith("Monitoring: ACTIVE every 6 hours")
+
+
+def test_resume_reopens_a_closed_window_without_starting_a_scan_itself(client, cli, monkeypatch, capsys):
+    store = ui.MonitorStore(client.root, client.profile)
+    store.save_plan(plan(client, state="paused"))
+    opened = Mock()
+    monkeypatch.setattr(ui, "open_window", opened)
+    answers = iter(["2", "0"])
+    monkeypatch.setattr("builtins.input", lambda prompt: next(answers))
+    ui.monitoring_menu(client, ui.Preferences(client.root))
+    assert store.plan()["state"] == "active" and not cli.runs
+    opened.assert_called_once_with(client, monitor=True)
+    assert "NOT RUNNING (monitoring window closed)" in capsys.readouterr().out
+
+
+def test_pause_and_resume_while_the_window_runs(client, cli, monkeypatch):
+    store = ui.MonitorStore(client.root, client.profile)
+    store.save_plan(plan(client))
+    answers = iter(["2", "2", "0"])
+    monkeypatch.setattr("builtins.input", lambda prompt: next(answers))
+    states = []
+    real = store.save_plan
+    monkeypatch.setattr(ui.MonitorStore, "save_plan", lambda self, p: (states.append(p["state"]), real(p)))
+    with store.hold():
+        ui.monitoring_menu(client, ui.Preferences(client.root))
+    assert states == ["paused", "active"]
+
+
+def test_stop_keeps_running_scans(client, cli, monkeypatch, capsys):
+    store = ui.MonitorStore(client.root, client.profile)
+    saved = plan(client)
+    store.save_plan(saved)
+    monitor_at(client, store, {"now": START}).tick(saved, store.progress(saved))
+    answers = iter(["4", "y"])
+    monkeypatch.setattr("builtins.input", lambda prompt: next(answers))
+    ui.monitoring_menu(client, ui.Preferences(client.root))
+    assert not store.plan() and not cli.cancelled
+    assert "Running scans were kept" in capsys.readouterr().out
+
+
+def test_stop_and_cancel_cancels_only_monitored_running_scans(client, cli, monkeypatch):
+    store = ui.MonitorStore(client.root, client.profile)
+    saved = plan(client)
+    store.save_plan(saved)
+    monitor_at(client, store, {"now": START}).tick(saved, store.progress(saved))
+    cli.runs.append({"run_id": str(uuid4()), "kind": "scan", "status": "running", "targets": ["other.example"],
+                     "created_at": START.isoformat(), "finished_at": None})
+    answers = iter(["5", "y"])
+    monkeypatch.setattr("builtins.input", lambda prompt: next(answers))
+    ui.monitoring_menu(client, ui.Preferences(client.root))
+    assert not store.plan()
+    assert cli.cancelled == [("run", "cancel", cli.runs[0]["run_id"], "--reason", "continuous monitoring stopped")]
+
+
+def test_change_interval_applies_from_the_last_scan(client, cli, monkeypatch):
+    store = ui.MonitorStore(client.root, client.profile)
+    saved = plan(client)
+    store.save_plan(saved)
+    answers = iter(["3", "1", "0"])
+    monkeypatch.setattr("builtins.input", lambda prompt: next(answers))
+    ui.monitoring_menu(client, ui.Preferences(client.root))
+    assert store.plan()["interval"] == 3600
+
+
+def test_monitoring_window_runs_the_worker_and_exits_when_stopped(client, cli, monkeypatch, capsys):
+    store = ui.MonitorStore(client.root, client.profile)
+    saved = plan(client)
+    store.save_plan(saved)
+    processor = Mock(error=None)
+    monkeypatch.setattr(ui, "LocalProcessor", Mock(return_value=processor))
+
+    def stop_from_home(seconds):
+        store.save_plan({**saved, "state": "stopped"})
+    monkeypatch.setattr(ui.time, "sleep", stop_from_home)
+    assert ui.monitor_window(client) == 0
+    processor.start.assert_called_once()
+    processor.close.assert_called_once()
+    assert len(cli.runs) == 1 and not cli.cancelled and not store.running()
+    out = " ".join(capsys.readouterr().out.split())
+    assert "Current scan: QUEUED" in out and "stopped from Home" in out
+
+
+def test_closing_the_monitoring_window_pauses_without_cancelling(client, cli, monkeypatch, capsys):
+    store = ui.MonitorStore(client.root, client.profile)
+    store.save_plan(plan(client))
+    processor = Mock(error=None)
+    monkeypatch.setattr(ui, "LocalProcessor", Mock(return_value=processor))
+    monkeypatch.setattr(ui.time, "sleep", Mock(side_effect=KeyboardInterrupt))
+    assert ui.monitor_window(client) == 0
+    processor.close.assert_called_once()
+    assert store.plan()["state"] == "active" and not cli.cancelled
+    assert "not cancelled" in capsys.readouterr().out
+
+
+def test_a_second_monitoring_window_refuses_to_start(client, cli, monkeypatch):
+    store = ui.MonitorStore(client.root, client.profile)
+    store.save_plan(plan(client))
+    processor = Mock()
+    monkeypatch.setattr(ui, "LocalProcessor", processor)
+    with store.hold(), pytest.raises(ui.UiError, match="already running"):
+        ui.monitor_window(client)
+    processor.assert_not_called()
+    assert not cli.runs
+
+
+def test_worker_failure_stops_the_window_without_cancelling(client, cli, monkeypatch):
+    store = ui.MonitorStore(client.root, client.profile)
+    store.save_plan(plan(client))
+    monkeypatch.setattr(ui, "LocalProcessor", Mock(return_value=Mock(error="OperationalError")))
+    with pytest.raises(ui.UiError, match="worker stopped"):
+        ui.monitor_window(client)
+    assert store.plan()["state"] == "active" and not cli.cancelled
+
+
+def test_monitoring_window_command_carries_paths_only(client):
+    argv = ui.window_arguments(client, monitor=True)
+    assert argv[-1] == "--monitor" and "--run" not in argv
+    assert str(client.token_file) in argv and "WATCHTOWER_TOKEN" not in " ".join(argv)

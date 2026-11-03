@@ -9,7 +9,7 @@ from __future__ import annotations
 import argparse
 import base64
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import fcntl
 import hashlib
 import io
@@ -17,6 +17,7 @@ import json
 import os
 from pathlib import Path
 import random
+import re
 import shlex
 import shutil
 import signal
@@ -313,19 +314,21 @@ def session_lock(client, key):
         yield
 
 
-def window_arguments(client, *, run=None, dashboard=False):
+def window_arguments(client, *, run=None, dashboard=False, monitor=False):
     argv = [client.python, str(client.root / "terminal_ui.py"), "--profile", client.profile,
             "--project", client.project, "--token-file", str(client.token_file), "--hold"]
     if dashboard:
         argv.append("--dashboard")
+    elif monitor:
+        argv.append("--monitor")
     else:
         argv += ["--run", str(UUID(str(run)))]
     return argv
 
 
-def open_window(client, *, run=None, dashboard=False):
+def open_window(client, *, run=None, dashboard=False, monitor=False):
     """Best-effort dispatch. A run remains queued if the OS refuses a window."""
-    argv = window_arguments(client, run=run, dashboard=dashboard)
+    argv = window_arguments(client, run=run, dashboard=dashboard, monitor=monitor)
     title = "Devils Eyes - " + safe(client.project)
     if sys.platform.startswith("linux") and client.env.get("WSL_DISTRO_NAME"):
         powershell = shutil.which("powershell.exe", path=client.env.get("PATH"))
@@ -516,10 +519,10 @@ def scan_window(client, run_id):
         return watch_run(client, run_id, work=True)
 
 
-def process_here(client, run_id):
+def process_here(client, run_id=None, *, monitor=False):
     # Keep the worker's process-wide egress guard and signal cleanup isolated
     # from Home, just as they are in a separate terminal window.
-    argv = [arg for arg in window_arguments(client, run=run_id) if arg != "--hold"]
+    argv = [arg for arg in window_arguments(client, run=run_id, monitor=monitor) if arg != "--hold"]
     process = subprocess.Popen(argv, cwd=client.root, env=client.env)
     try:
         return process.wait()
@@ -868,21 +871,26 @@ def serve_dashboard(client, *, browse=False):
                 server.wait()
 
 
+def accessible_projects(client, preferences):
+    """(project, token file) for every active project the remembered tokens of this profile can open."""
+    candidates = {}
+    paths = [client.token_file]
+    paths += [Path(p) for key, p in preferences.data["tokens"].items()
+              if isinstance(key, str) and key.startswith(client.profile + ":") and isinstance(p, str)]
+    for path in dict.fromkeys(paths):
+        candidate = Client(client.root, profile=client.profile, token_file=path, env=client.env)
+        try:
+            for project in candidate.json("projects"):
+                if not project["archived"]:
+                    candidates[project["slug"]] = (project, path)
+        except UiError:
+            continue
+    return sorted(candidates.values(), key=lambda entry: entry[0]["slug"])
+
+
 def select_project(client, preferences):
     while True:
-        candidates = {}
-        paths = [client.token_file]
-        paths += [Path(p) for key, p in preferences.data["tokens"].items()
-                  if isinstance(key, str) and key.startswith(client.profile + ":") and isinstance(p, str)]
-        for path in dict.fromkeys(paths):
-            candidate = Client(client.root, profile=client.profile, token_file=path, env=client.env)
-            try:
-                for project in candidate.json("projects"):
-                    if not project["archived"]:
-                        candidates[project["slug"]] = (project, path)
-            except UiError:
-                continue
-        rows = sorted(candidates.values(), key=lambda entry: entry[0]["slug"])
+        rows = accessible_projects(client, preferences)
         if not rows:
             tell("No accessible projects found with the selected token files. Create a project, choose another token, or check .env and PostgreSQL.")
         options = {str(i): safe(f"{p['name']} ({p['slug']}, {p['role']})") for i, (p, _) in enumerate(rows, 1)}
@@ -948,6 +956,473 @@ def settings_menu(client, preferences):
             tell("It uses MongoDB, targets.json and setting.json. Platform scope lives in PostgreSQL.")
 
 
+# -- Continuous monitoring --------------------------------------------------
+#
+# Home writes a monitoring plan; a separate window runs the worker and starts
+# one scan per monitored target each interval. Scans start through the same CLI
+# as Scan once, so saved authorization, exclusions, request limits and
+# detection-rule approvals apply unchanged.
+
+INTERVALS = {"1": ("1 hour", 3600), "2": ("3 hours", 3 * 3600), "3": ("6 hours", 6 * 3600),
+             "4": ("12 hours", 12 * 3600), "5": ("24 hours", 24 * 3600)}
+DEFAULT_INTERVAL = 6 * 3600
+AWAKE = ("Monitoring runs only while this computer is awake and the monitoring window stays open. "
+         "Sleep, shutdown or closing the window pauses it. Missed scans are not replayed: one scan "
+         "starts when monitoring resumes.")
+
+
+def interval_seconds(value):
+    match = re.fullmatch(r"(\d{1,6})\s*([mhd])", value.strip().lower())
+    if not match:
+        raise ValueError("Use a number followed by m, h or d, for example 90m, 8h or 2d.")
+    seconds = int(match.group(1)) * {"m": 60, "h": 3600, "d": 86400}[match.group(2)]
+    if not 15 * 60 <= seconds <= 30 * 86400:
+        raise ValueError("Choose an interval between 15 minutes and 30 days.")
+    return seconds
+
+
+def describe_interval(seconds):
+    if seconds % 86400 == 0 and seconds > 86400:
+        return f"{seconds // 86400} days"
+    for unit, size in (("hour", 3600), ("minute", 60)):
+        if seconds % size == 0:
+            count = seconds // size
+            return f"{count} {unit}" + ("" if count == 1 else "s")
+    return f"{seconds} seconds"
+
+
+def local_time(value):
+    try:
+        return datetime.fromisoformat(value).astimezone().strftime("%Y-%m-%d %H:%M")
+    except (TypeError, ValueError):
+        return "-"
+
+
+def watch_key(watch):
+    return watch["project"] + ":" + ",".join(watch["targets"])
+
+
+class MonitorStore:
+    """One monitoring plan per profile, under the ignored files/terminal-ui directory.
+
+    Home writes the plan and the monitoring window writes its progress, so
+    neither process overwrites the other. The window holds a lock while it runs;
+    a closed or crashed window releases it.
+    """
+    def __init__(self, root, profile):
+        files = Path(root) / "files" / "terminal-ui"
+        self.directory = files / "monitors"
+        self.plan_path = self.directory / (profile + ".json")
+        self.progress_path = self.directory / (profile + ".progress.json")
+        self.lock_path = files / "locks" / ("monitor-" + profile)
+
+    @staticmethod
+    def _read(path):
+        try:
+            data = json.loads(path.read_text())
+        except (OSError, ValueError):
+            return {}
+        return data if isinstance(data, dict) else {}
+
+    def _write(self, path, data):
+        self.directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+        descriptor, name = tempfile.mkstemp(dir=self.directory)
+        try:
+            with os.fdopen(descriptor, "w") as output:
+                json.dump(data, output, indent=2)
+            os.replace(name, path)
+        finally:
+            Path(name).unlink(missing_ok=True)
+
+    def plan(self):
+        """The plan, unless it is missing, stopped or unreadable."""
+        plan = self._read(self.plan_path)
+        valid = (plan.get("state") in ("active", "paused") and isinstance(plan.get("interval"), int)
+                 and isinstance(plan.get("watches"), list) and plan["watches"])
+        return plan if valid else {}
+
+    def save_plan(self, plan):
+        self._write(self.plan_path, plan)
+
+    def progress(self, plan):
+        progress = self._read(self.progress_path)
+        if progress.get("plan") != plan.get("id") or not isinstance(progress.get("watches"), dict):
+            return {"plan": plan.get("id"), "watches": {}}
+        return progress
+
+    def save_progress(self, progress):
+        self._write(self.progress_path, progress)
+
+    def running(self):
+        if not self.lock_path.exists():
+            return False
+        with self.lock_path.open("a") as handle:
+            try:
+                fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                return True
+            fcntl.flock(handle, fcntl.LOCK_UN)
+            return False
+
+    @contextmanager
+    def hold(self):
+        self.lock_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        with self.lock_path.open("a") as handle:
+            try:
+                fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                raise UiError("Continuous monitoring is already running in another window.") from None
+            yield
+
+
+def monitored_scans(runs, watch):
+    """Scans of this watch's targets, newest first. A whole-scope watch counts every scan in its project."""
+    return [r for r in runs if r.get("kind") == "scan" and (not watch["targets"] or r.get("targets") == watch["targets"])]
+
+
+def next_scan(plan, entry, current, running, now):
+    if not running:
+        return "when monitoring resumes"
+    if plan["state"] == "paused":
+        return "paused"
+    started = entry.get("started_at")
+    due = datetime.fromisoformat(started) + timedelta(seconds=plan["interval"]) if started else now
+    if due > now:
+        return local_time(due.isoformat())
+    return "after the current scan finishes" if current else "now"
+
+
+class Monitor:
+    """Starts one scan per monitored target each interval, never two for the same target at once."""
+    def __init__(self, client, store, *, clock=None):
+        self.client = client
+        self.store = store
+        self.clock = clock or (lambda: datetime.now(timezone.utc))
+        self.clients = {}
+
+    def client_for(self, watch):
+        key = (watch["project"], watch["token_file"])
+        if key not in self.clients:
+            self.clients[key] = Client(self.client.root, profile=self.client.profile, project=watch["project"],
+                                       token_file=watch["token_file"], env=self.client.env)
+        return self.clients[key]
+
+    def tick(self, plan, progress, *, start=True):
+        """Start due scans when start is set; return what each watch shows."""
+        now = self.clock()
+        views = []
+        for watch in plan["watches"]:
+            entry = progress["watches"].setdefault(watch_key(watch), {"sequence": 0})
+            client = self.client_for(watch)
+            view = {"watch": watch, "entry": entry, "runs": None, "phase": None}
+            views.append(view)
+            try:
+                view["runs"] = client.json("run", "list", "--limit", "50")
+            except UiError as exc:
+                entry["error"] = str(exc)
+                continue
+            try:
+                busy = any(r["status"] not in FINISHED for r in monitored_scans(view["runs"], watch))
+                if start and plan["state"] == "active" and not busy and self.due(plan, entry, now):
+                    self.start(plan, progress, watch, entry, client, now)
+                    view["runs"] = client.json("run", "list", "--limit", "50")
+                elif start:
+                    entry.pop("error", None)
+                current = next((r for r in monitored_scans(view["runs"], watch) if r["status"] not in FINISHED), None)
+                if current:
+                    view["phase"] = current_phase(client.json("run", "show", current["run_id"]))
+            except UiError as exc:
+                entry["error"] = str(exc)
+        return views
+
+    @staticmethod
+    def due(plan, entry, now):
+        started = entry.get("started_at")
+        return not started or datetime.fromisoformat(started) + timedelta(seconds=plan["interval"]) <= now
+
+    def start(self, plan, progress, watch, entry, client, now):
+        # The key only changes once this start is saved, so a crash in between
+        # returns the same run on restart instead of queueing a second one.
+        digest = hashlib.sha256(watch_key(watch).encode()).hexdigest()[:16]
+        key = f"monitor-{plan['id']}-{digest}-{entry['sequence']}"
+        args = ["run", "start", "--reason", "continuous monitoring every " + describe_interval(plan["interval"]),
+                "--reuse-active", "--idempotency-key", key]
+        for target in watch["targets"]:
+            args += ["--target", target]
+        # The same lock as Scan once, so Home and monitoring cannot queue the same target together.
+        with session_lock(client, "start"):
+            try:
+                run = client.json(*args)
+            except UiError as exc:
+                if "idempotency key" in str(exc):
+                    # The scope changed since this key was used; retry with a new key.
+                    entry["sequence"] += 1
+                    self.store.save_progress(progress)
+                raise
+        entry.update(sequence=entry["sequence"] + 1, run_id=run["run_id"], started_at=now.isoformat())
+        entry.pop("error", None)
+        self.store.save_progress(progress)
+
+
+def monitoring_lines(plan, views, now, running):
+    state = plan["state"].upper() if running else "NOT RUNNING (monitoring window closed)"
+    count = len(plan["watches"])
+    lines = [f"Continuous monitoring: {state} | every {describe_interval(plan['interval'])} | "
+             f"{count} target{'' if count == 1 else 's'}"]
+    for view in views:
+        watch, entry, runs = view["watch"], view["entry"], view["runs"]
+        lines.append(watch["label"] + " (project " + watch["project"] + ")")
+        if runs is None:
+            lines.append("  Status unavailable: " + entry.get("error", "check .env and PostgreSQL"))
+            continue
+        scans = monitored_scans(runs, watch)
+        current = next((r for r in scans if r["status"] not in FINISHED), None)
+        last = next((r for r in scans if r["status"] in FINISHED), None)
+        lines.append("  Current scan: " + (f"{current['status'].upper()} {current['run_id'][:8]}"
+                                           + (" - " + view["phase"] if view["phase"] else "") if current else "none"))
+        lines.append("  Last scan: " + (f"{last['status'].upper()} {last['run_id'][:8]}, finished "
+                                        + local_time(last.get("finished_at")) if last else "none yet"))
+        lines.append("  Next scan: " + next_scan(plan, entry, current, running, now))
+        if entry.get("error"):
+            lines.append("  Problem: " + entry["error"])
+    return lines
+
+
+def monitoring_status(client):
+    """Home's status line, or None when nothing is monitored."""
+    store = MonitorStore(client.root, client.profile)
+    plan = store.plan()
+    if not plan:
+        return None
+    if not store.running():
+        return "Monitoring: NOT RUNNING - resume it from Start scan > Continuous monitoring"
+    line = f"Monitoring: {plan['state'].upper()} every {describe_interval(plan['interval'])}"
+    progress = store.progress(plan)
+    starts = [progress["watches"].get(watch_key(w), {}).get("started_at") for w in plan["watches"]]
+    if plan["state"] == "active" and all(starts):
+        due = min(datetime.fromisoformat(s) for s in starts) + timedelta(seconds=plan["interval"])
+        line += " | next " + (local_time(due.isoformat()) if due > datetime.now(timezone.utc) else "now")
+    return line
+
+
+def monitor_window(client, *, interval=10):
+    """The separate monitoring terminal: worker, schedule and live status until stopped or closed."""
+    store = MonitorStore(client.root, client.profile)
+    with store.hold():
+        plan = store.plan()
+        if not plan:
+            tell("Continuous monitoring is not set up. Use Home > Start scan > Continuous monitoring.")
+            return 0
+        tell(AWAKE)
+        tell("Closing this window or Ctrl+C pauses monitoring and cancels no scan. "
+             "Pause, resume or stop it from Home > Start scan > Continuous monitoring.")
+        tell("This window's worker may also process due jobs and notifications from other projects.")
+        monitor = Monitor(client, store)
+        processor = LocalProcessor(client)
+        processor.start()
+        mark = SCREEN.mark()
+        previous = None
+        try:
+            while True:
+                plan = store.plan()
+                if not plan:
+                    tell("Monitoring was stopped from Home. Scans in progress were not cancelled by this window.")
+                    return 0
+                progress = store.progress(plan)
+                lines = monitoring_lines(plan, monitor.tick(plan, progress), monitor.clock(), True)
+                store.save_progress(progress)
+                if SCREEN.enabled or lines != previous:
+                    with SCREEN.frame(mark):
+                        tell()
+                        for line in lines:
+                            tell(line)
+                    previous = lines
+                if processor.error:
+                    raise UiError("The local worker stopped (" + processor.error + "). Monitoring is paused; "
+                                  "resume it from Home. No scan was cancelled.")
+                time.sleep(interval)
+        except KeyboardInterrupt:
+            tell("Monitoring window closed. Monitoring is paused until you resume it from Home; "
+                 "scans in progress were not cancelled.")
+            return 0
+        finally:
+            processor.close()
+
+
+def launch_monitor(client):
+    while True:
+        try:
+            open_window(client, monitor=True)
+            tell("Monitoring window requested. Home stays available here.")
+            tell("If no window appears, choose Resume monitoring in Continuous monitoring to retry.")
+            return
+        except (UiError, OSError, subprocess.TimeoutExpired) as exc:
+            tell(str(exc) if isinstance(exc, UiError) else "Could not open the monitoring window.")
+            action = menu("Where should monitoring run?", {"1": "Retry new window", "2": "Run monitoring in this terminal",
+                                                         "0": "Back - monitoring stays set up; resume it later"}, "0")
+            if action == "2":
+                process_here(client, monitor=True)
+                return
+            if action == "0":
+                return
+
+
+def choose_interval(current=DEFAULT_INTERVAL):
+    options = {key: label + (" (default)" if seconds == DEFAULT_INTERVAL else "") for key, (label, seconds) in INTERVALS.items()}
+    default = next((key for key, (_, seconds) in INTERVALS.items() if seconds == current), "6")
+    choice = menu("How often should it scan?", {**options, "6": "Custom interval", "0": "Back"}, default)
+    if choice == "0":
+        raise Back()
+    if choice == "6":
+        return field("Interval, for example 90m, 8h or 2d", validate=interval_seconds)
+    return INTERVALS[choice][1]
+
+
+def all_watches(client, preferences):
+    """Every authorized project you can operate, monitoring all targets in its published scope."""
+    watches = []
+    for project, token in accessible_projects(client, preferences):
+        if project["role"] not in ("owner", "operator"):
+            continue
+        candidate = Client(client.root, profile=client.profile, project=project["slug"], token_file=token, env=client.env)
+        try:
+            roots = saved_roots(candidate.json("status"))
+        except UiError:
+            continue
+        if roots:
+            watches.append({"project": project["slug"], "token_file": str(token), "targets": [], "label": ", ".join(roots)})
+    return watches
+
+
+def setup_monitoring(client, preferences, store):
+    tell("Continuous monitoring scans now, then again at the interval you choose.")
+    status = client.json("status")
+    roots = saved_roots(status)
+    if roots:
+        options = {str(i): domain for i, domain in enumerate(roots, 1)}
+        new_choice, saved_choice = str(len(roots) + 1), str(len(roots) + 2)
+        action = menu("What would you like to monitor?", {**options, new_choice: "Add a new target",
+                      saved_choice: "Choose another saved target", "0": "Back"}, "1")
+        if action == "0":
+            return client
+        if action == saved_choice:
+            return setup_monitoring(select_project(client, preferences), preferences, store)
+        if action == new_choice:
+            client, target = add_scan_target(client, status, preferences)
+        else:
+            target = roots[int(action) - 1]
+    else:
+        client, target = add_scan_target(client, status, preferences)
+    watches = [{"project": client.project, "token_file": str(client.token_file), "targets": [target], "label": target}]
+    choice = menu("Which targets should be monitored?", {"1": "Only " + target + " (recommended)",
+                  "2": "All authorized projects and every target in their scope", "0": "Back"}, "1")
+    if choice == "0":
+        raise Back()
+    if choice == "2":
+        watches = all_watches(client, preferences)
+        if not watches:
+            tell("No authorized project with a published scope was found for your token files.")
+            raise Back()
+        tell("Each interval would scan every target below:")
+        for watch in watches:
+            tell(f"  {watch['label']} (project {watch['project']})")
+        if not yes_no("Monitor ALL of these projects and targets?", default=False):
+            raise Back()
+    interval = choose_interval()
+    tell("\nMonitor:")
+    for watch in watches:
+        tell(f"  {watch['label']} (project {watch['project']})")
+    tell("Every " + describe_interval(interval) + ". The first scan starts as soon as the monitoring window opens.")
+    tell("A target that is already being scanned is not scanned twice; monitoring waits for that scan.")
+    tell("Saved permissions, exclusions, request limits and detection-rule approvals apply to every scan.")
+    tell(AWAKE)
+    tell("Stopping monitoring later keeps a running scan unless you choose Stop and cancel.")
+    if not yes_no("Start continuous monitoring?", default=False):
+        raise Back()
+    store.save_plan({"id": str(uuid4()), "state": "active", "interval": interval,
+                     "created_at": datetime.now(timezone.utc).isoformat(), "watches": watches})
+    launch_monitor(client)
+    return client
+
+
+def view_monitored_scan(monitor, views, running):
+    current = [(view["watch"], run) for view in views for run in monitored_scans(view["runs"] or [], view["watch"])
+               if run["status"] not in FINISHED]
+    if not current:
+        tell("No monitored scan is running right now.")
+        return
+    choice = "1"
+    if len(current) > 1:
+        options = {str(i): f"{watch['label']} ({run['run_id'][:8]})" for i, (watch, run) in enumerate(current, 1)}
+        choice = menu("Which scan?", {**options, "0": "Back"}, "1")
+        if choice == "0":
+            return
+    watch, run = current[int(choice) - 1]
+    if not running:
+        tell("The monitoring window is closed, so this scan only advances when monitoring resumes.")
+    watch_run(monitor.client_for(watch), run["run_id"])
+
+
+def monitoring_menu(client, preferences):
+    store = MonitorStore(client.root, client.profile)
+    while True:
+        plan = store.plan()
+        if not plan:
+            if store.running():
+                tell("The previous monitoring window is still stopping. Try again in a moment.")
+                return client
+            return setup_monitoring(client, preferences, store)
+        running = store.running()
+        monitor = Monitor(client, store)
+        views = monitor.tick(plan, store.progress(plan), start=False)
+        for line in monitoring_lines(plan, views, monitor.clock(), running):
+            tell(line)
+        if not running:
+            toggle = "Resume monitoring (reopen the monitoring window)"
+        elif plan["state"] == "paused":
+            toggle = "Resume monitoring"
+        else:
+            toggle = "Pause monitoring (a running scan finishes; no new scans start)"
+        action = menu("Continuous monitoring", {"1": "View current scan progress", "2": toggle, "3": "Change interval",
+                      "4": "Stop monitoring (keep any running scan)", "5": "Stop monitoring and cancel running scans",
+                      "0": "Back"})
+        if action == "0":
+            return client
+        if action == "1":
+            view_monitored_scan(monitor, views, running)
+        elif action == "2":
+            plan["state"] = "paused" if running and plan["state"] == "active" else "active"
+            store.save_plan(plan)
+            if not running:
+                launch_monitor(client)
+            else:
+                tell("Monitoring " + ("paused. A running scan finishes; no new scans start." if plan["state"] == "paused"
+                                      else "resumed. A scan starts now if one is due."))
+        elif action == "3":
+            plan["interval"] = choose_interval(plan["interval"])
+            store.save_plan(plan)
+            tell("Interval changed to every " + describe_interval(plan["interval"]) +
+                 ". The next scan is counted from the start of the last one.")
+        elif action == "4":
+            if yes_no("Stop monitoring? Running scans are not cancelled and can be resumed from View scan progress.",
+                      default=False):
+                plan["state"] = "stopped"
+                store.save_plan(plan)
+                tell("Monitoring stopped. Running scans were kept.")
+                return client
+        elif yes_no("Stop monitoring and cancel every running scan of the monitored targets?", default=False):
+            # Stop first, so the window starts nothing new while scans are cancelled.
+            plan["state"] = "stopped"
+            store.save_plan(plan)
+            for view in views:
+                for run in monitored_scans(view["runs"] or [], view["watch"]):
+                    if run["status"] not in FINISHED:
+                        monitor.client_for(view["watch"]).show("run", "cancel", run["run_id"],
+                                                               "--reason", "continuous monitoring stopped")
+            tell("Monitoring stopped and running scans were cancelled. Existing findings are not resolved.")
+            return client
+
+
 def home(root=ROOT):
     preferences = Preferences(root)
     profile = preferences.data.get("profile", "development")
@@ -983,12 +1458,19 @@ def home(root=ROOT):
             except UiError as exc:
                 lines.append("Connection / access unavailable: " + str(exc))
                 lines.append("Retry after checking .env and PostgreSQL, or switch project through option 8.")
+            monitoring = monitoring_status(client)
+            if monitoring:
+                lines.append(monitoring)
             SCREEN.show_status(lines)
             action = menu("Home", HOME)
             if action == "0":
                 return 0
             if action == "1":
-                client = start_scan(client, preferences)
+                kind = menu("How do you want to scan?", {"1": "Scan once", "2": "Continuous monitoring", "0": "Back"}, "1")
+                if kind == "1":
+                    client = start_scan(client, preferences)
+                elif kind == "2":
+                    client = monitoring_menu(client, preferences)
             elif action == "2":
                 progress_menu(client)
             elif action == "3":
@@ -1023,6 +1505,7 @@ def main(argv=None):
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--run", type=UUID)
     mode.add_argument("--dashboard", action="store_true")
+    mode.add_argument("--monitor", action="store_true", help="Run continuous monitoring in this window")
     parser.add_argument("--open-browser", action="store_true", help="Open the dashboard after its server is ready")
     parser.add_argument("--hold", action="store_true")
     parser.add_argument("--no-clear", action="store_true", help="Print screens one after another instead of redrawing in place")
@@ -1036,7 +1519,7 @@ def main(argv=None):
     saved_handlers = {sig: signal.signal(sig, interrupted) for sig in (signal.SIGTERM, signal.SIGHUP)}
     code = 0
     try:
-        if args.run or args.dashboard:
+        if args.run or args.dashboard or args.monitor:
             prefs = Preferences().data if args.dashboard else {}
             client = Client(profile=args.profile or prefs.get("profile", "development"),
                             project=args.project or prefs.get("project", ""),
@@ -1047,6 +1530,9 @@ def main(argv=None):
                 sys.stdout.flush()
             if args.dashboard:
                 code = serve_dashboard(client, browse=args.open_browser)
+            elif args.monitor:
+                SCREEN.status = ["DEVILS EYES | Continuous monitoring", f"Profile: {client.profile}"]
+                code = monitor_window(client)
             else:
                 SCREEN.status = ["DEVILS EYES | Scan progress", f"Project: {safe(client.project)} | Profile: {client.profile}"]
                 code = scan_window(client, args.run)

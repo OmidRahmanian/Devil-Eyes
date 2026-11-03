@@ -44,7 +44,7 @@ private and backed up if you need these credentials later.
 
 | Action | Behavior |
 | --- | --- |
-| Start scan | Add a domain or website link, confirm permissions and start; or pick a saved target to scan again |
+| Start scan | **Scan once**: add a domain or website link, confirm permissions and start, or scan a saved target again. **Continuous monitoring**: scan a target now and repeat it on a schedule |
 | View scan progress | Selects an existing run; inspect, watch, open/resume a processing window, or explicitly cancel |
 | Browse inventory | Lists assets, optionally filtered by search text |
 | Browse findings | Lists findings; inspect details, triage or queue a retest |
@@ -62,7 +62,9 @@ terminal commands.
 
 ## Add a target and scan
 
-Choose **1 — Start scan**. With no saved target, setup opens immediately:
+Choose **1 — Start scan**, then **Scan once** for a single scan or
+**Continuous monitoring** for repeated scans (see below). With no saved target,
+setup opens immediately:
 paste a domain or website link, choose whether permission covers all subdomains,
 enter any exclusions, and confirm your permission to scan. Website links use
 their hostname; a page URL does not restrict scanning to that path, and a
@@ -89,11 +91,74 @@ used. If opening a window fails, Retry and Process in this terminal remain
 available for the same run. No scan
 starts without confirmed scope, and pending detection rules remain disabled.
 
-The header reports connection/access status, scope and the latest run. It refreshes
-when Home is redisplayed; it is not a live background monitor. The scope menu
+The header reports connection/access status, scope and the latest run, plus a
+Monitoring line while continuous monitoring is set up. It refreshes when Home
+is redisplayed; Home itself is not a background monitor. The scope menu
 does not add wildcard coverage unless you explicitly choose it and confirm
 authorization. Platform scope lives in PostgreSQL. Legacy `targets.json` and
 `setting.json` remain separate and unchanged by platform menus.
+
+## Continuous monitoring
+
+Choose **1 — Start scan > Continuous monitoring** to scan a target now and then
+again at a fixed interval, without running a scheduler and a worker yourself.
+
+1. Pick a saved target, **Add a new target** (the same setup and permission
+   confirmation as Scan once), or **Choose another saved target**.
+2. Choose what to monitor. **Only the selected target** is the default.
+   **All authorized projects** lists every project you can operate together with
+   its targets, and needs a separate confirmation. These whole-project watches
+   follow each project's current published scope.
+3. Choose an interval: 1, 3, 6 (default), 12 or 24 hours, or a custom value
+   such as `90m`, `8h` or `2d` (15 minutes to 30 days).
+4. Review the summary and confirm. A separate monitoring window opens (a new
+   Windows console on WSL), and Home stays available.
+
+The monitoring window runs a worker and starts the first scan immediately. It
+then starts the next scan one interval after the previous one started. Every
+scan goes through the same path as Scan once, so saved permissions, exclusions,
+request limits and pending detection-rule approvals apply unchanged. Inventory,
+change comparisons, findings and alerts appear in the dashboard and terminal
+views as for any other scan.
+
+**Monitoring only runs while the computer is awake and the monitoring window
+stays open.** Sleep, shutdown or closing the window pauses it. Missed intervals
+are not replayed: when monitoring resumes, one scan starts if one is due.
+
+Choose **Continuous monitoring** again to see the status: active, paused or not
+running, the interval, and for each target the current scan and phase, the last
+finished scan, and the next scheduled scan. The controls are:
+
+| Control | Effect |
+| --- | --- |
+| View current scan progress | Follows the running monitored scan; Ctrl+C stops only the viewer |
+| Pause monitoring | No new scans start; a running scan finishes |
+| Resume monitoring | Scheduling continues; if the window was closed, it reopens |
+| Change interval | Applies from the start of the last scan |
+| Stop monitoring (keep any running scan) | Ends monitoring; **a running scan is not cancelled** and can be resumed from View scan progress |
+| Stop monitoring and cancel running scans | Ends monitoring and cancels running scans of the monitored targets only; findings are not resolved |
+
+Duplicates and overlaps are prevented in several ways:
+
+- Only one monitoring window runs per profile, enforced by a lock. A second
+  window refuses to start.
+- A target is never scanned twice at once. If a scan of it is still running,
+  including one started with Scan once, the next scan waits until it finishes.
+- Each scheduled scan has a fixed request key until its start is saved. After a
+  crash or restart, the same scan is returned instead of a second one being
+  queued.
+
+If a scan cannot start, for example because the database is unreachable or the
+scope changed, the window shows the problem and retries on its next check. If
+the worker itself stops, the window explains the cause and exits; resume it
+from Home. Closing the window, Ctrl+C, a crash or a restart never cancels a
+scan. Home then shows `Monitoring: NOT RUNNING`, and nothing restarts
+automatically until you choose **Resume monitoring**.
+
+The plan and its progress are stored under the ignored
+`files/terminal-ui/monitors/` directory, with token-file paths only. Like scan
+windows, the monitoring worker may also process due jobs and notifications from
+other projects.
 
 ## Separate scan window
 
