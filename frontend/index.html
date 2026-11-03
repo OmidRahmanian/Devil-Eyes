@@ -4,13 +4,13 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="referrer" content="no-referrer">
-  <title>WatchTower</title>
+  <title>Devils Eyes</title>
   <link rel="stylesheet" href="/static/app.css">
   <script src="/static/app.js" defer></script>
 </head>
 <body>
   <header class="bar">
-    <div class="brand"><span class="eye" aria-hidden="true">&lt;((|@|))&gt;</span> WatchTower</div>
+    <div class="brand"><span class="eye" aria-hidden="true">&lt;((|@|))&gt;</span> Devils Eyes</div>
     <nav id="nav" class="nav" hidden>
       <select id="project" aria-label="Project"></select>
       <button data-view="overview">Overview</button>
@@ -30,13 +30,13 @@
   <main id="main">
     <section id="signin" class="panel narrow">
       <h1>Sign in</h1>
-      <p>Paste an API token. It stays in this browser tab only and is sent to this server as a bearer token.</p>
+      <p>Run <strong>Copy-Dashboard-Token.cmd</strong> in your Windows project folder, then paste the copied token below.</p>
       <form id="signin-form">
         <label for="token">API token</label>
         <input id="token" type="password" autocomplete="off" spellcheck="false" placeholder="wt_xxxxxxxx_..." required>
         <button type="submit">Sign in</button>
       </form>
-      <p class="hint">Create one with <code>watchtower bootstrap &lt;project&gt; --owner "Your Name"</code>.</p>
+      <p class="hint">The helper copies the token for your selected terminal project. Your token stays in this browser tab. You can also paste an existing API token.</p>
     </section>
     <section id="view" hidden></section>
   </main>

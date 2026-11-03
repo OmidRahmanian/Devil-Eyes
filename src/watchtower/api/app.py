@@ -577,7 +577,7 @@ def create_app(
     settings = settings or Settings()
     scope = scope or ScopeService(database, settings.scope)
     app = FastAPI(
-        title="WatchTower",
+        title="Devils Eyes",
         version=watchtower.__version__,
         description="Authorized attack surface monitoring. Every project route needs a bearer API token.",
         # The interactive docs pages load third-party scripts; serving them on the

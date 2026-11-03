@@ -7,6 +7,18 @@ source .venv/bin/activate
 python launcher.py --platform
 ```
 
+The banner defaults to twice its original speed (about 2–3 seconds). In your
+Ubuntu terminal, adjust the speed multiplier for one launch:
+
+```bash
+DEVILS_EYES_BANNER_SPEED=4 python launcher.py --platform  # faster
+DEVILS_EYES_BANNER_SPEED=1 python launcher.py --platform  # original slow reveal
+DEVILS_EYES_BANNER_SPEED=0 python launcher.py --platform  # instant
+```
+
+Use `export DEVILS_EYES_BANNER_SPEED=4` to keep that pace for the current
+terminal session. Reduced-motion and no-animation settings still take priority.
+
 The large banner appears once. Choose an accessible project by number. Use
 **Create project** for a new project, **Use another token file** for existing
 credentials, or **Change profile** for Development, Lab or Production. Creating
@@ -24,14 +36,14 @@ private and backed up if you need these credentials later.
 
 | Action | Behavior |
 | --- | --- |
-| Start scan | Shows scope and phase options, asks for confirmation, queues once and opens a progress window |
+| Start scan | Add a domain or website link, confirm permissions and start; or pick a saved target to scan again |
 | View scan progress | Selects an existing run; inspect, watch, open/resume a processing window, or explicitly cancel |
 | Browse inventory | Lists assets, optionally filtered by search text |
 | Browse findings | Lists findings; inspect details, triage or queue a retest |
-| Manage targets and scope | Shows scope history, publishes a replacement scope, checks a target without network traffic, or revokes current scope |
+| Advanced target settings | Edit scope, exclusions and authorization; inspect history or revoke permission |
 | View alerts | Shows notification history and delivery status |
 | Open dashboard | Reuses a running local server or opens a server window, then opens the browser |
-| Switch or create project | Offers numbered accessible projects and token-file selection |
+| Switch saved targets / projects | Offers numbered accessible projects and token-file selection; also available inside Start scan |
 | Settings and help | Changes profile or explains credentials, legacy mode and noninteractive commands |
 
 **0** returns from menus; **b** returns from text fields. Enter accepts the shown
@@ -39,6 +51,29 @@ default. Ctrl+C returns to Home during an action, or stops a progress viewer.
 End-of-input exits cleanly. Output wraps for narrow terminals and respects
 `NO_COLOR`. Captured content is printed as escaped text, never interpreted as
 terminal commands.
+
+## Add a target and scan
+
+Choose **1 — Start scan**. With no saved target, setup opens immediately:
+paste a domain or website link, choose whether permission covers all subdomains,
+enter any exclusions, and confirm your permission to scan. Website links use
+their hostname; a page URL does not restrict scanning to that path, and a
+`www` hostname is not silently expanded to its parent domain.
+
+For assets you own, enter your name. For other permission types, supply the
+program link, contract or approval reference and the organization granting it.
+The final confirmation saves the target and starts one scan. Back or declining
+before confirmation saves nothing. Later visits offer saved domains, **Add a
+new target**, and **Choose another saved target / project** in the same flow.
+New targets added alongside an existing scope get a separate project and token
+automatically, preserving the previous target's scope, exclusions and history.
+Saved scans reuse their existing authorization and scan only the selected root.
+
+On WSL, Windows opens a separate terminal for scan progress, leaving Home
+available. On macOS and other Linux installations a separate terminal is also
+used. If opening a window fails, Retry and Process in this terminal remain
+available for the same run. No scan
+starts without confirmed scope, and pending detection rules remain disabled.
 
 The header reports connection/access status, scope and the latest run. It refreshes
 when Home is redisplayed; it is not a live background monitor. The scope menu
@@ -50,6 +85,9 @@ authorization. Platform scope lives in PostgreSQL. Legacy `targets.json` and
 
 On macOS, WatchTower uses Terminal.app; macOS may request permission for terminal
 automation. On Linux it detects GNOME Terminal, Konsole, Xfce Terminal or xterm.
+On Windows/WSL, PowerShell launches a new Windows console running the same WSL
+distribution and the checkout's Python. Arguments contain only paths and
+identifiers; the child privately loads its own environment and installed tools.
 If no window can be opened, choose **Retry**, **Process in this terminal**, or
 **Back**. All choices retain the same run ID; they do not queue another scan.
 If the OS accepts a launch but the window fails afterward, use **View scan

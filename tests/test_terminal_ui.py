@@ -1,5 +1,6 @@
 """Terminal UX and process boundaries: never launch terminals or outbound scans."""
 import os
+import base64
 import shlex
 import subprocess
 from unittest.mock import Mock
@@ -81,7 +82,7 @@ def test_remembered_project_skips_repeated_setup(client, tmp_path, monkeypatch, 
     select.assert_not_called()
     assert show.call_args_list[0].args == ("assets",)
     assert show.call_args_list[1].args == ("alerts",)
-    assert capsys.readouterr().out.count("WATCHTOWER | Platform") == 3
+    assert capsys.readouterr().out.count("DEVILS EYES | Platform") == 3
 
 
 def test_missing_remembered_project_returns_to_selection(client, tmp_path, monkeypatch, capsys):
@@ -97,12 +98,15 @@ def test_missing_remembered_project_returns_to_selection(client, tmp_path, monke
 
 def test_start_queues_once_and_passes_existing_id_to_window(client, monkeypatch):
     run = {"run_id": str(uuid4())}
-    client.json = Mock(side_effect=[[], {"scope": {"rules": [{"effect": "include", "pattern": "acme.example"}]}}, run])
+    client.json = Mock(side_effect=[[], {"scope": {"rules": [{"effect": "include", "pattern": "acme.example"}]}}, [], run])
+    monkeypatch.setattr("builtins.input", lambda prompt: "1")
     monkeypatch.setattr(launcher, "yes_no", lambda *a, **kw: True)
     launch = Mock()
     monkeypatch.setattr(ui, "launch_scan", launch)
     ui.start_scan(client)
     assert len([c for c in client.json.call_args_list if c.args[:2] == ("run", "start")]) == 1
+    queued = client.json.call_args.args
+    assert queued[queued.index("--target") + 1] == "acme.example"
     launch.assert_called_once_with(client, run["run_id"])
 
 
@@ -116,12 +120,200 @@ def test_existing_active_run_prevents_duplicate_queue(client, monkeypatch, capsy
     assert "already active" in capsys.readouterr().out
 
 
-def test_start_requires_scope_and_confirmation(client, monkeypatch):
+def test_start_with_no_target_opens_setup_and_can_go_back(client, monkeypatch):
     launch = Mock()
     monkeypatch.setattr(ui, "launch_scan", launch)
     client.json = Mock(side_effect=[[], {"scope": None}])
-    ui.start_scan(client)
+    monkeypatch.setattr("builtins.input", lambda prompt: "b")
+    with pytest.raises(ui.Back):
+        ui.start_scan(client)
     launch.assert_not_called()
+
+
+@pytest.mark.parametrize("value,expected", [
+    ("Example.com", "example.com"),
+    ("https://acme.example/about?q=1#team", "acme.example"),
+    ("acme.example/contact", "acme.example"),
+    ("https://www.acme.example/", "www.acme.example"),
+    ("https://acme.example:443", "acme.example"),
+    ("https://bücher.example", "xn--bcher-kva.example"),
+])
+def test_target_accepts_links_without_expanding_parent_domain(value, expected):
+    assert ui.target_domain(value) == expected
+
+
+@pytest.mark.parametrize("value", ["", "localhost", "127.0.0.1", "*.acme.example", "ftp://acme.example",
+                                         "https://user:pass@acme.example", "https://acme.example:8080", "acme.example;id"])
+def test_target_rejects_invalid_or_unsupported_links(value):
+    with pytest.raises(ValueError):
+        ui.target_domain(value)
+
+
+def test_first_scan_adds_target_and_queues_in_one_flow(client, monkeypatch):
+    run = {"run_id": str(uuid4())}
+    client.json = Mock(side_effect=[[], {"scope": None}, [], run])
+    client.show = Mock()
+    answers = iter(["https://acme.example/about", "y", "old.acme.example", "4", "https://acme.example/security", "Acme", "y"])
+    monkeypatch.setattr("builtins.input", lambda prompt: next(answers))
+    launch = Mock()
+    monkeypatch.setattr(ui, "launch_scan", launch)
+    assert ui.start_scan(client) is client
+    args = client.show.call_args.args
+    assert args[:2] == ("scope", "publish")
+    assert "*.acme.example" in args and "old.acme.example" in args and "bug_bounty_program" in args
+    assert "--i-am-authorized" in args
+    assert client.json.call_args.args[:4] == ("run", "start", "--target", "acme.example")
+    launch.assert_called_once_with(client, run["run_id"])
+    assert ui.Preferences(client.root).data["project"] == "acme"
+
+
+def test_setup_does_not_expand_subdomains_by_default(client, monkeypatch):
+    client.show = Mock()
+    answers = iter(["acme.example", "", "", "1", "Ada", "y"])
+    monkeypatch.setattr("builtins.input", lambda prompt: next(answers))
+    _, target = ui.add_scan_target(client, {"scope": None}, ui.Preferences(client.root))
+    assert target == "acme.example"
+    args = client.show.call_args.args
+    assert "*.acme.example" not in args and "asset_owner" in args
+
+
+@pytest.mark.parametrize("ending", [["0"], ["1", "Ada", "n"]])
+def test_new_target_cancel_does_not_publish_create_or_queue(client, monkeypatch, ending):
+    client.json = Mock(side_effect=[[], {"scope": None}])
+    client.show = Mock()
+    answers = iter(["acme.example", "y", "-", *ending])
+    monkeypatch.setattr("builtins.input", lambda prompt: next(answers))
+    with pytest.raises(ui.Back):
+        ui.start_scan(client)
+    client.show.assert_not_called()
+    assert client.json.call_count == 2
+    assert not ui.Preferences(client.root).path.exists()
+
+
+def test_new_target_preserves_existing_project_scope_and_token(client, monkeypatch):
+    client.token_file.write_text("keep-existing-token")
+    new = ui.Client(client.root, project="new", token_file=client.root / "new.token", env={})
+    client.json = Mock(side_effect=[[], {"scope": {"rules": [{"effect": "include", "pattern": "old.example"}]}}])
+    client.show, new.show = Mock(), Mock()
+    run = {"run_id": str(uuid4())}
+    new.json = Mock(side_effect=[[], run])
+    constructor = Mock(return_value=new)
+    monkeypatch.setattr(ui, "Client", constructor)
+    answers = iter(["n", "https://new.example/", "y", "-", "1", "Ada", "y"])
+    monkeypatch.setattr("builtins.input", lambda prompt: next(answers))
+    monkeypatch.setattr(ui, "launch_scan", Mock())
+    assert ui.start_scan(client) is new
+    assert client.show.call_args.args[0] == "bootstrap"
+    assert client.token_file.read_text() == "keep-existing-token"
+    assert new.show.call_args.args[:2] == ("scope", "publish")
+    assert "old.example" not in new.show.call_args.args
+    assert ui.Preferences(client.root).data["project"] == "new"
+
+
+def test_scope_save_failure_never_queues(client, monkeypatch):
+    client.json = Mock(side_effect=[[], {"scope": None}])
+    client.show = Mock(side_effect=ui.UiError("Permission denied"))
+    answers = iter(["acme.example", "y", "-", "1", "Ada", "y"])
+    monkeypatch.setattr("builtins.input", lambda prompt: next(answers))
+    with pytest.raises(ui.UiError):
+        ui.start_scan(client)
+    assert client.json.call_count == 2
+
+
+def test_concurrent_run_started_during_setup_is_not_duplicated(client, monkeypatch):
+    client.json = Mock(side_effect=[[], {"scope": {"rules": [{"effect": "include", "pattern": "acme.example"}]}},
+                                  [{"run_id": str(uuid4()), "status": "queued"}]])
+    answers = iter(["1", "y"])
+    monkeypatch.setattr("builtins.input", lambda prompt: next(answers))
+    launch = Mock()
+    monkeypatch.setattr(ui, "launch_scan", launch)
+    assert ui.start_scan(client) is client
+    launch.assert_not_called()
+    assert all(c.args[:2] != ("run", "start") for c in client.json.call_args_list)
+
+
+def test_wsl_scan_opens_separate_window_and_keeps_home(client, monkeypatch):
+    client.env["WSL_DISTRO_NAME"] = "Ubuntu-24.04"
+    process, window = Mock(), Mock()
+    monkeypatch.setattr(ui, "process_here", process)
+    monkeypatch.setattr(ui, "open_window", window)
+    run_id = str(uuid4())
+    ui.launch_scan(client, run_id)
+    window.assert_called_once_with(client, run=run_id)
+    process.assert_not_called()
+
+
+def test_wsl_launch_encodes_paths_as_data_without_shell_secrets(client, monkeypatch):
+    client.env.update(WSL_DISTRO_NAME="Ubuntu-24.04", SECRET="not-in-launch-command")
+    client.root = client.root / "space ' quote $(touch NEVER) `echo nope`"
+    monkeypatch.setattr(ui.sys, "platform", "linux")
+    monkeypatch.setattr(ui.shutil, "which", lambda *a, **kw: "powershell.exe")
+    invoke = Mock(return_value=Mock(returncode=0))
+    monkeypatch.setattr(ui.subprocess, "run", invoke)
+    run_id = str(uuid4())
+    ui.open_window(client, run=run_id)
+    argv = invoke.call_args.args[0]
+    assert argv[:4] == ["powershell.exe", "-NoProfile", "-NonInteractive", "-EncodedCommand"]
+    script = base64.b64decode(argv[-1]).decode("utf-16-le")
+    assert "-WindowStyle Normal" in script
+    payload = script.split("FromBase64String('")[1].split("')")[0]
+    arguments = base64.b64decode(payload).decode()
+    assert str(client.root) in arguments and run_id in arguments and "--hold" in arguments
+    assert "not-in-launch-command" not in script + arguments
+    assert "shell" not in invoke.call_args.kwargs
+
+
+def test_wsl_window_launch_failure_offers_existing_fallback(client, monkeypatch):
+    client.env["WSL_DISTRO_NAME"] = "Ubuntu-24.04"
+    monkeypatch.setattr(ui.sys, "platform", "linux")
+    monkeypatch.setattr(ui.shutil, "which", lambda *a, **kw: "powershell.exe")
+    monkeypatch.setattr(ui.subprocess, "run", Mock(return_value=Mock(returncode=1)))
+    with pytest.raises(ui.UiError, match="could not open"):
+        ui.open_window(client, run=str(uuid4()))
+
+
+def test_separate_window_environment_finds_installed_tools(client):
+    assert client.env["PATH"].split(os.pathsep)[0] == str(ui.Path(client.python).parent)
+
+
+def test_dashboard_waits_for_readiness_before_opening_browser(client, monkeypatch):
+    monkeypatch.setattr(ui, "dashboard_state", Mock(side_effect=["unavailable", "unavailable", "unavailable", "ready"]))
+    server = Mock()
+    server.poll.side_effect = [None, None, 0]
+    server.wait.return_value = 0
+    monkeypatch.setattr(ui.subprocess, "Popen", Mock(return_value=server))
+    sleep = Mock()
+    monkeypatch.setattr(ui.time, "sleep", sleep)
+    browse = Mock()
+    monkeypatch.setattr(ui, "open_dashboard_browser", browse)
+    assert ui.serve_dashboard(client, browse=True) == 0
+    browse.assert_called_once_with(client)
+    sleep.assert_called_once()
+    server.terminate.assert_not_called()
+
+
+def test_dashboard_startup_failure_does_not_open_browser(client, monkeypatch):
+    monkeypatch.setattr(ui, "dashboard_state", lambda: "unavailable")
+    server = Mock()
+    server.poll.return_value = 1
+    monkeypatch.setattr(ui.subprocess, "Popen", Mock(return_value=server))
+    browse = Mock()
+    monkeypatch.setattr(ui, "open_dashboard_browser", browse)
+    with pytest.raises(ui.UiError, match="exited"):
+        ui.serve_dashboard(client, browse=True)
+    browse.assert_not_called()
+
+
+def test_dashboard_interrupt_reaps_owned_server(client, monkeypatch):
+    monkeypatch.setattr(ui, "dashboard_state", lambda: "unavailable")
+    server = Mock()
+    server.poll.return_value = None
+    monkeypatch.setattr(ui.subprocess, "Popen", Mock(return_value=server))
+    monkeypatch.setattr(ui.time, "sleep", Mock(side_effect=KeyboardInterrupt))
+    with pytest.raises(KeyboardInterrupt):
+        ui.serve_dashboard(client)
+    server.terminate.assert_called_once()
+    server.wait.assert_called_once_with(timeout=10)
 
 
 def test_start_lock_blocks_a_second_home(client):
@@ -162,7 +354,7 @@ def test_linux_launch_uses_argument_array(client, monkeypatch):
     invoke = Mock(return_value=process)
     monkeypatch.setattr(ui.subprocess, "Popen", invoke)
     ui.open_window(client, run=str(uuid4()))
-    assert invoke.call_args.args[0][:4] == ["xterm", "-T", "WatchTower - acme", "-e"]
+    assert invoke.call_args.args[0][:4] == ["xterm", "-T", "Devils Eyes - acme", "-e"]
     assert "shell" not in invoke.call_args.kwargs
 
 

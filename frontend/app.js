@@ -76,7 +76,9 @@ function notice(message, kind) {
 
 class ApiError extends Error {
   constructor(status, body) {
-    super((body && body.detail) || `request failed (${status})`);
+    const detail = body && body.detail;
+    super(typeof detail === "string" ? detail : Array.isArray(detail)
+      ? detail.map((item) => item.msg || "Invalid input").join("; ") : `Request failed (${status})`);
     this.status = status;
   }
 }
@@ -127,19 +129,30 @@ function storage(action, key, value) {
 }
 
 async function signIn(token) {
+  if (!token) { notice("Paste your copied token to sign in.", "warn"); return; }
+  const button = document.querySelector("#signin-form button[type=submit]");
+  button.disabled = true;
+  button.textContent = "Signing in…";
   state.token = token;
   try {
     state.projects = await api("/projects");
   } catch (error) {
     state.token = null;
-    notice(error.status === 401 ? "That token was not accepted." : error.message, "bad");
+    storage("remove", TOKEN_KEY);
+    notice(error.status === 401 ? "Token not accepted. Run Copy-Dashboard-Token.cmd for your selected project and try again."
+      : error instanceof TypeError ? "Cannot reach the server. Keep the dashboard terminal open and try again." : error.message, "bad");
+    return;
+  } finally {
+    button.disabled = false;
+    button.textContent = "Sign in";
+  }
+  if (!state.projects.length) {
+    state.token = null;
+    storage("remove", TOKEN_KEY);
+    notice("This token has no projects. Copy the token for your selected terminal project.", "warn");
     return;
   }
   storage("set", TOKEN_KEY, token);
-  if (!state.projects.length) {
-    notice("This token has no projects.", "warn");
-    return;
-  }
   const remembered = storage("get", PROJECT_KEY);
   state.project = state.projects.find((p) => p.id === remembered) || state.projects[0];
   const select = document.getElementById("project");

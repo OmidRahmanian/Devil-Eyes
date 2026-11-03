@@ -6,6 +6,7 @@ from datetime import datetime
 import getpass
 import ipaddress
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -15,6 +16,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import time
 from urllib.parse import urlsplit
 
 from session import acquire_session, running_pid, stop_session
@@ -60,7 +62,7 @@ TAGLINES = ("Always watching.", "See what changes.", "Know your surface.")
 
 
 def banner(stream=None):
-    """Render the startup eye without requiring terminal colour packages."""
+    """Reveal the eye in a live terminal; keep captured output instant and plain."""
     stream = sys.stdout if stream is None else stream
     width = min(shutil.get_terminal_size(fallback=(80, 24)).columns, 80)
     eye = EYE
@@ -70,18 +72,58 @@ def banner(stream=None):
         eye = ("<((|@|))>",)
     colour = stream.isatty() and "NO_COLOR" not in os.environ and os.environ.get("TERM") != "dumb"
     grey, red, white, reset = ("\033[90m", "\033[1;31m", "\033[1;37m", "\033[0m") if colour else ("", "", "", "")
+    animate = colour and not any(os.environ.get(key) for key in ("NO_ANIMATION", "REDUCE_MOTION"))
+    # 2 = twice the original pace; 0 = instant. Invalid values use the default.
+    try:
+        speed = float(os.environ.get("DEVILS_EYES_BANNER_SPEED", "2"))
+    except ValueError:
+        speed = 2.0
+    if not math.isfinite(speed) or speed < 0:
+        speed = 2.0
+    animate = animate and speed > 0
     eye_width = max(len(line.replace("|", "")) for line in eye)
     padding = " " * max(0, (width - eye_width) // 2)
-    print(file=stream)
-    for line in eye:
-        parts = line.split("|")
-        rendered = "".join((red if i % 2 else grey) + part for i, part in enumerate(parts))
-        print(padding + rendered + reset, file=stream)
-    print(file=stream)
-    print(white + "WATCHTOWER".center(width) + reset, file=stream)
-    print(red + random.choice(TAGLINES).center(width) + reset, file=stream)
-    print(grey + "Discover. Track. Monitor.".center(width) + reset, file=stream)
-    print(red + ("-" * min(width, 76)).center(width) + reset, file=stream, flush=True)
+
+    def centered(text):
+        return text[:width].center(width).rstrip()
+
+    def reveal(text, style, *, step=4, delay=0.012):
+        # Indentation appears immediately; only visible characters are animated.
+        indent = len(text) - len(text.lstrip())
+        stream.write(style + text[:indent])
+        for offset in range(indent, len(text), step):
+            stream.write(text[offset:offset + step])
+            stream.flush()
+            if animate:
+                time.sleep(delay / speed)
+
+    if animate:
+        stream.write("\033[?25l")
+    try:
+        print(file=stream, flush=True)
+        for line in eye:
+            stream.write(padding)
+            for index, part in enumerate(line.split("|")):
+                reveal(part, red if index % 2 else grey)
+            print(reset, file=stream, flush=True)
+            if animate:
+                time.sleep(0.09 / speed)
+        print(file=stream, flush=True)
+        reveal(centered("DEVILS EYES"), white, step=1, delay=0.065)
+        print(reset, file=stream, flush=True)
+        if animate:
+            time.sleep(0.22 / speed)
+        reveal(centered(random.choice(TAGLINES)), red, step=1, delay=0.025)
+        print(reset, file=stream, flush=True)
+        subtitle = "Discover. Track. Monitor." if width >= 25 else "Discover. Monitor."
+        reveal(centered(subtitle), grey, step=2, delay=0.02)
+        print(reset, file=stream, flush=True)
+        reveal(("-" * min(width, 76)).center(width).rstrip(), red, step=2, delay=0.012)
+        print(reset, file=stream, flush=True)
+    finally:
+        if animate:
+            stream.write(reset + "\033[?25h")
+            stream.flush()
 
 
 def say(message):
@@ -298,7 +340,7 @@ def start_mongodb(root, python, env):
 def run_monitor(root, python, env, lock):
     log_path = root / "files/watchtower.log"
     env = dict(env, WATCHTOWER_LOCK_FD=str(lock.fileno()))
-    say("\nStarting WatchTower. Your first discovery runs after the selected interval.")
+    say("\nStarting Devils Eyes. Your first discovery runs after the selected interval.")
     say(f"Live log: {log_path}\nPress Ctrl+C to stop monitoring.\n")
     with log_path.open("a", buffering=1) as log:
         log.write(f"\n--- WatchTower session {datetime.now().isoformat(timespec='seconds')} ---\n")
@@ -385,7 +427,7 @@ def wizard(root=ROOT, configure_only=False):
         check_dependencies(python, env)
     pid = running_pid(root)
     if pid:
-        if not yes_no(f"WatchTower is running (PID {pid}). Stop that session and continue?", default=False):
+        if not yes_no(f"Devils Eyes is running (PID {pid}). Stop that session and continue?", default=False):
             say("Configuration unchanged. The existing session is still running.")
             return 0
         stop_session(pid)
@@ -448,7 +490,7 @@ def platform_ready(root, python, env):
     )
     if result.returncode:
         raise RuntimeError(
-            f"The WatchTower platform needs Python 3.11+ with the package installed. Run: {python} -m pip install -e '.[api]'"
+            f"The Devils Eyes platform needs Python 3.11+ with the package installed. Run: {python} -m pip install -e '.[api]'"
         )
     if not env.get("WATCHTOWER__DATABASE__URL"):
         raise RuntimeError("Set WATCHTOWER__DATABASE__URL in .env (see docs/installation.md), then try again.")
@@ -463,12 +505,12 @@ def platform_wizard(root=ROOT):
 
 
 def main(argv=None):
-    parser = argparse.ArgumentParser(description="Configure a WatchTower target and start monitoring interactively.")
+    parser = argparse.ArgumentParser(description="Configure a Devils Eyes target and start monitoring interactively.")
     mode = parser.add_mutually_exclusive_group()
-    mode.add_argument("--platform", action="store_true", help="Use the WatchTower platform (PostgreSQL, authorized scope)")
+    mode.add_argument("--platform", action="store_true", help="Use the Devils Eyes platform (PostgreSQL, authorized scope)")
     mode.add_argument("--legacy", action="store_true", help="Use legacy discovery (MongoDB and Subfinder)")
     parser.add_argument("--configure-only", action="store_true", help="Save the legacy setup without starting services")
-    parser.add_argument("--banner", action="store_true", help="Preview the WatchTower banner without changing configuration")
+    parser.add_argument("--banner", action="store_true", help="Preview the Devils Eyes banner without changing configuration")
     args = parser.parse_args(argv)
     try:
         if args.banner:
@@ -478,14 +520,14 @@ def main(argv=None):
             return platform_wizard()
         if args.legacy or args.configure_only:
             return wizard(configure_only=args.configure_only)
-        if choose("How do you want to run WatchTower?", {
+        if choose("How do you want to run Devils Eyes?", {
             "1": "Platform: authorized scope, runs, findings and dashboard (PostgreSQL)",
             "2": "Legacy discovery: Subfinder with MongoDB",
         }) == "1":
             return platform_wizard()
         return wizard()
     except (KeyboardInterrupt, EOFError):
-        say("\nWatchTower stopped.")
+        say("\nDevils Eyes stopped.")
         return 0
     except (OSError, RuntimeError, ValueError) as error:
         say(f"\nCould not continue: {error}")

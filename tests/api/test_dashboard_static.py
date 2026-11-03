@@ -40,7 +40,7 @@ def client(tmp_path):
 
 def test_dashboard_and_assets_are_served_with_security_headers(client):
     page = client.get("/")
-    assert page.status_code == 200 and "WatchTower" in page.text
+    assert page.status_code == 200 and "Devils Eyes" in page.text
     csp = page.headers["content-security-policy"]
     assert "script-src 'self'" in csp and "'unsafe-inline'" not in csp and "frame-ancestors 'none'" in csp
     script = client.get("/static/app.js")
@@ -50,4 +50,4 @@ def test_dashboard_and_assets_are_served_with_security_headers(client):
 
 def test_no_third_party_docs_pages_on_the_dashboard_origin(client):
     assert client.get("/api/v1/docs").status_code == 404
-    assert client.get("/api/v1/openapi.json").json()["info"]["title"] == "WatchTower"
+    assert client.get("/api/v1/openapi.json").json()["info"]["title"] == "Devils Eyes"

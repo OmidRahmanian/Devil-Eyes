@@ -7,6 +7,7 @@ itself; no credentials are embedded in shell commands or generated scripts.
 from __future__ import annotations
 
 import argparse
+import base64
 from contextlib import contextmanager
 from datetime import datetime, timezone
 import fcntl
@@ -24,6 +25,7 @@ import textwrap
 import threading
 import time
 from urllib.error import URLError
+from urllib.parse import urlsplit
 from urllib.request import urlopen
 from uuid import UUID, uuid4
 import webbrowser
@@ -37,8 +39,8 @@ PROFILES = ("development", "lab", "production")
 PHASES = ("discovery", "dns", "http", "checks", "finalize")
 HOME = {
     "1": "Start scan", "2": "View scan progress", "3": "Browse inventory",
-    "4": "Browse findings", "5": "Manage targets and scope", "6": "View alerts",
-    "7": "Open dashboard", "8": "Switch or create project", "9": "Settings and help", "0": "Exit",
+    "4": "Browse findings", "5": "Advanced target settings", "6": "View alerts",
+    "7": "Open dashboard", "8": "Switch saved targets / projects", "9": "Settings and help", "0": "Exit",
 }
 
 
@@ -106,6 +108,8 @@ class Client:
         self.root = Path(root).absolute()
         self.python = launcher.python_executable(self.root)
         self.env = dict(env if env is not None else launcher.runtime_environment(self.root, self.python))
+        # Separate WSL windows do not inherit an activated virtual environment.
+        self.env["PATH"] = str(Path(self.python).parent) + os.pathsep + self.env.get("PATH", os.defpath)
         self.profile = profile
         self.project = project
         self.token_file = Path(token_file or self.env.get("WATCHTOWER_TOKEN_FILE", "~/.config/watchtower/token")).expanduser().absolute()
@@ -167,7 +171,25 @@ def window_arguments(client, *, run=None, dashboard=False):
 def open_window(client, *, run=None, dashboard=False):
     """Best-effort dispatch. A run remains queued if the OS refuses a window."""
     argv = window_arguments(client, run=run, dashboard=dashboard)
-    title = "WatchTower - " + safe(client.project)
+    title = "Devils Eyes - " + safe(client.project)
+    if sys.platform.startswith("linux") and client.env.get("WSL_DISTRO_NAME"):
+        powershell = shutil.which("powershell.exe", path=client.env.get("PATH"))
+        if not powershell:
+            raise UiError("Windows PowerShell is unavailable in WSL. Check Windows interoperability, or choose Process in this terminal.")
+        arguments = subprocess.list2cmdline(["--distribution", client.env["WSL_DISTRO_NAME"],
+                                            "--cd", str(client.root), "--exec", *argv])
+        payload = base64.b64encode(arguments.encode("utf-8")).decode("ascii")
+        # Only paths/identifiers cross this boundary, as data. Windows opens a
+        # new console; its Python process privately reloads the checkout's .env.
+        script = ("$ErrorActionPreference = 'Stop'; "
+                  "$arguments = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('" + payload + "')); "
+                  "Start-Process -FilePath 'wsl.exe' -ArgumentList $arguments -WindowStyle Normal -ErrorAction Stop")
+        encoded = base64.b64encode(script.encode("utf-16-le")).decode("ascii")
+        result = subprocess.run([powershell, "-NoProfile", "-NonInteractive", "-EncodedCommand", encoded],
+                                capture_output=True, text=True, timeout=20)
+        if result.returncode:
+            raise UiError("Windows could not open a new terminal. Retry or choose Process in this terminal.")
+        return
     if sys.platform == "darwin":
         command = "cd " + shlex.quote(str(client.root)) + " && exec " + shlex.join(argv)
         script = ('on run argv\n tell application "Terminal"\n activate\n'
@@ -201,7 +223,7 @@ def open_window(client, *, run=None, dashboard=False):
 def scope_summary(status):
     revision = status.get("scope")
     if not revision:
-        return "None published - scanning is unavailable"
+        return "No target yet - choose 1 to add one and scan"
     return ", ".join(("exclude " if r["effect"] == "exclude" else "") + r["pattern"] for r in revision["rules"])
 
 
@@ -377,29 +399,117 @@ def launch_scan(client, run_id):
                 return
 
 
-def start_scan(client):
-    # Serializes launches from multiple home menus on this checkout.
+def target_domain(value):
+    """Accept a website URL without guessing or expanding its parent domain."""
+    value = value.strip()
+    parsed = urlsplit(value if "://" in value else "//" + value)
+    if parsed.scheme and parsed.scheme.lower() not in ("http", "https"):
+        raise ValueError("Use an http/https website link or a domain.")
+    if parsed.username is not None or parsed.password is not None:
+        raise ValueError("Use a link without embedded login credentials.")
+    if parsed.port not in (None, 80, 443):
+        raise ValueError("Use a domain or a website on port 80 or 443.")
+    return launcher.domain_name(parsed.hostname or "")
+
+
+def saved_roots(status):
+    roots = set()
+    for rule in (status.get("scope") or {}).get("rules", []):
+        if rule["effect"] == "include":
+            try:
+                roots.add(launcher.domain_name(rule["pattern"].removeprefix("*.")))
+            except ValueError:
+                continue
+    return sorted(roots)
+
+
+def add_scan_target(client, status, preferences):
+    """Collect and confirm a target before saving anything or queueing a run."""
+    tell("\nAdd a target")
+    tell("Paste a root domain or website link. The hostname is used; URL paths are not scan boundaries.")
+    domain = field("Domain or website link", validate=target_domain)
+    tell("Target: " + domain)
+    include = [domain]
+    if launcher.yes_no("Discover and scan ALL subdomains (*." + domain + ") too?", default=False):
+        include.append("*." + domain)
+    excluded = field("Subdomains to skip (Enter: none)", "-", lambda value: launcher.exclusions(value, domain))
+    choice = menu("Permission to scan", {**{k: label for k, (_, label) in launcher.AUTHORIZATIONS.items()}, "0": "Back"})
+    if choice == "0":
+        raise Back()
+    kind = launcher.AUTHORIZATIONS[choice][0]
+    if kind == "asset_owner":
+        granted = field("Your name", os.environ.get("USER", ""), validate=launcher.required_text)
+        reference = "Asset ownership confirmed in terminal for " + domain
+    else:
+        reference = field("Permission link, contract or approval reference", validate=launcher.required_text)
+        granted = field("Organization or person granting permission", validate=launcher.required_text)
+    tell("\nScan: " + ", ".join(include))
+    tell("Skip: " + (", ".join(excluded) or "none"))
+    tell("This discovers subdomains, resolves DNS, probes websites and runs approved checks.")
+    if not launcher.yes_no("Confirm you are authorized for these targets, save and start the scan?", default=False):
+        raise Back()
+    if status.get("scope"):
+        # A separate project preserves the previous target's policy and history.
+        slug = launcher.project_slug(domain.replace(".", "-")[:50]) + "-" + uuid4().hex[:8]
+        directory = preferences.directory / "tokens"
+        directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+        token = directory / (client.profile + "-" + slug + "-" + uuid4().hex)
+        client.show("bootstrap", slug, "--name", domain, "--owner", os.environ.get("USER", "Local owner"), "--save-token", str(token))
+        client = Client(client.root, profile=client.profile, project=slug, token_file=token, env=client.env)
+        # Remember the new token immediately, even if saving permissions fails.
+        preferences.save(client.profile, client.project, client.token_file)
+    args = ["scope", "publish", "--authorization-kind", kind, "--reference", reference,
+            "--granted-by", granted, "--i-am-authorized"]
+    for pattern in include:
+        args += ["--include", pattern]
+    for pattern in excluded:
+        args += ["--exclude", pattern]
+    client.show(*args)
+    preferences.save(client.profile, client.project, client.token_file)
+    return client, domain
+
+
+def active_scan(client):
+    active = [r for r in client.json("run", "list", "--limit", "200") if r["status"] not in FINISHED]
+    if active:
+        tell("A run is already active. View or resume it instead of queueing a duplicate:")
+        for run in active:
+            tell(f"  {run['run_id']} {run['status']}")
+    return bool(active)
+
+
+def start_scan(client, preferences=None):
+    preferences = preferences or Preferences(client.root)
+    if active_scan(client):
+        return client
+    status = client.json("status")
+    roots = saved_roots(status)
+    if status.get("scope"):
+        options = {str(i): domain for i, domain in enumerate(roots, 1)}
+        action = menu("What would you like to scan?", {**options, "n": "Add a new target",
+                      "s": "Choose another saved target / project", "0": "Back"}, "1" if roots else "n")
+        if action == "0":
+            return client
+        if action == "s":
+            return start_scan(select_project(client, preferences), preferences)
+        if action == "n":
+            client, target = add_scan_target(client, status, preferences)
+        else:
+            target = roots[int(action) - 1]
+            tell("Target: " + target + " | Saved permissions and exclusions apply.")
+            if not launcher.yes_no("Start scan?", default=False):
+                return client
+    else:
+        client, target = add_scan_target(client, status, preferences)
+    # Recheck after the wizard, under the launch lock, in case another window queued work.
     with session_lock(client, "start"):
-        active = [r for r in client.json("run", "list", "--limit", "200") if r["status"] not in FINISHED]
-        if active:
-            tell("A run is already active. View or resume it instead of queueing a duplicate:")
-            for run in active:
-                tell(f"  {run['run_id']} {run['status']}")
-            return
-        status = client.json("status")
-        tell(f"Project: {client.project} | Profile: {client.profile}")
-        tell("Scope: " + scope_summary(status))
-        if not status.get("scope"):
-            tell("Publish scope through Manage targets and scope first.")
-            return
-        tell("Options: all authorized roots; Discovery > DNS > HTTP > Checks > Finalize.")
-        tell("Pending detection rules will not run. A separate local worker window will process the queue.")
-        if not launcher.yes_no("Queue this scan and open its progress window?", default=False):
-            return
-        run = client.json("run", "start", "--reason", "started from terminal home", "--reuse-active",
+        if active_scan(client):
+            return client
+        run = client.json("run", "start", "--target", target, "--reason", "started from terminal home", "--reuse-active",
                           "--idempotency-key", str(uuid4()))
     tell("Queued run " + run["run_id"])
     launch_scan(client, run["run_id"])
+    return client
 
 
 def select_run(client):
@@ -524,12 +634,60 @@ def open_dashboard(client):
                 break
             time.sleep(0.5)
     if dashboard_state() == "ready":
-        webbrowser.open("http://127.0.0.1:8080")
+        open_dashboard_browser(client)
         tell("Dashboard: http://127.0.0.1:8080 (the existing server is reused when available).")
     else:
         tell("Dashboard window requested. Check that window for startup errors or a port conflict.")
     tell("Sign in with your local token file: " + str(client.token_file))
-    tell("On macOS, copy privately: pbcopy < " + shlex.quote(str(client.token_file)))
+    if client.env.get("WSL_DISTRO_NAME"):
+        tell("Copy this project's token: clip.exe < " + shlex.quote(str(client.token_file)))
+    else:
+        tell("On macOS, copy privately: pbcopy < " + shlex.quote(str(client.token_file)))
+
+
+def open_dashboard_browser(client):
+    if client.env.get("WSL_DISTRO_NAME"):
+        powershell = shutil.which("powershell.exe", path=client.env.get("PATH"))
+        if powershell:
+            result = subprocess.run([powershell, "-NoProfile", "-NonInteractive", "-Command",
+                                     "Start-Process 'http://localhost:8080'"], capture_output=True, timeout=15)
+            if result.returncode == 0:
+                return
+        tell("Open http://localhost:8080 in your Windows browser.")
+    else:
+        webbrowser.open("http://127.0.0.1:8080")
+
+
+def serve_dashboard(client, *, browse=False):
+    """Start the server, wait for readiness, and reap it when this window closes."""
+    if dashboard_state() == "ready":
+        tell("Dashboard is already running at http://localhost:8080.")
+        if browse:
+            open_dashboard_browser(client)
+        return 0
+    if dashboard_state() == "other":
+        raise UiError("Port 8080 is occupied by another service. Stop that service or use another dashboard port.")
+    server = subprocess.Popen(client.command("serve"), cwd=client.root, env=client.env)
+    try:
+        for _ in range(60):
+            if server.poll() is not None:
+                raise UiError("Dashboard exited before it was ready. Check the server message above.")
+            if dashboard_state() == "ready":
+                tell("Dashboard ready: http://localhost:8080. Keep this window open; Ctrl+C stops the server.")
+                tell("Login token file: " + str(client.token_file))
+                if browse:
+                    open_dashboard_browser(client)
+                return server.wait()
+            time.sleep(0.25)
+        raise UiError("Dashboard startup timed out. Check database connectivity and port 8080.")
+    finally:
+        if server.poll() is None:
+            server.terminate()
+            try:
+                server.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                server.kill()
+                server.wait()
 
 
 def select_project(client, preferences):
@@ -633,7 +791,7 @@ def home(root=ROOT):
             return 0
     while True:
         try:
-            tell("\nWATCHTOWER | Platform")
+            tell("\nDEVILS EYES | Platform")
             tell(f"Project: {client.project} | Profile: {client.profile}")
             try:
                 status = client.json("status")
@@ -652,7 +810,7 @@ def home(root=ROOT):
             if action == "0":
                 return 0
             if action == "1":
-                start_scan(client)
+                client = start_scan(client, preferences)
             elif action == "2":
                 progress_menu(client)
             elif action == "3":
@@ -687,6 +845,7 @@ def main(argv=None):
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--run", type=UUID)
     mode.add_argument("--dashboard", action="store_true")
+    parser.add_argument("--open-browser", action="store_true", help="Open the dashboard after its server is ready")
     parser.add_argument("--hold", action="store_true")
     args = parser.parse_args(argv)
     # Terminal close and termination get the same cleanup path as Ctrl+C.
@@ -696,23 +855,22 @@ def main(argv=None):
     code = 0
     try:
         if args.run or args.dashboard:
-            client = Client(profile=args.profile, project=args.project, token_file=args.token_file)
+            prefs = Preferences().data if args.dashboard else {}
+            client = Client(profile=args.profile or prefs.get("profile", "development"),
+                            project=args.project or prefs.get("project", ""),
+                            token_file=args.token_file or prefs.get("token_file"))
             os.environ.update(client.env)  # settings/worker read credentials privately from .env
             if sys.stdout.isatty():
-                sys.stdout.write("\033]0;WatchTower - " + safe(client.project) + "\007")
+                sys.stdout.write("\033]0;Devils Eyes - " + safe(client.project) + "\007")
                 sys.stdout.flush()
             if args.dashboard:
-                if dashboard_state() == "ready":
-                    tell("Dashboard is already running at http://127.0.0.1:8080.")
-                else:
-                    tell("Dashboard: http://127.0.0.1:8080. Ctrl+C stops this server; Home remains open.")
-                    code = subprocess.call(client.command("serve"), cwd=client.root, env=client.env)
+                code = serve_dashboard(client, browse=args.open_browser)
             else:
                 code = scan_window(client, args.run)
         else:
             code = home()
     except (Back, KeyboardInterrupt, EOFError):
-        tell("\nWatchTower stopped. Runs were not implicitly cancelled.")
+        tell("\nDevils Eyes stopped. Runs were not implicitly cancelled.")
     except (UiError, OSError, subprocess.TimeoutExpired) as exc:
         tell(str(exc) if isinstance(exc, UiError) else "Could not continue. Check configuration and local tools.")
         code = 1

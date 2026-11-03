@@ -24,7 +24,7 @@ class PlatformLauncherTests(unittest.TestCase):
                 patch.object(launcher, "platform_ready") as ready, \
                 patch.object(launcher.subprocess, "run", return_value=Mock(returncode=0)) as run:
             self.assertEqual(launcher.platform_wizard(self.root), 0)
-        self.assertIn("WATCHTOWER", self.output.getvalue())
+        self.assertIn("DEVILS EYES", self.output.getvalue())
         ready.assert_called_once()
         args = run.call_args.args[0]
         self.assertEqual(args[-1], str(self.root / "terminal_ui.py"))
