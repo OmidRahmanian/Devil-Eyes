@@ -10,7 +10,9 @@ host's internal services from a worker.
 
 The worker's own infrastructure is the only exception: the database, the
 broker, and the configured DNS resolvers on port 53, given as exact
-``(address, port)`` pairs. Hostnames are not checked here because sockets
+``(address, port)`` pairs. The AI analysis worker never makes target requests;
+it installs the guard with ``only_allowed`` and one extra pair, the approved
+local model endpoint, so it can reach nothing else at all. Hostnames are not checked here because sockets
 only ever see addresses.
 
 It does not cover external tools a worker starts (they are separate
@@ -38,9 +40,13 @@ class EgressRefused(PermissionError):
 
 
 class EgressGuard:
-    def __init__(self, destinations: DestinationPolicy, allowed: Iterable[tuple[str, int]] = ()) -> None:
+    """``only_allowed`` refuses everything but the exact ``allowed`` pairs (the AI analysis worker)."""
+
+    def __init__(self, destinations: DestinationPolicy, allowed: Iterable[tuple[str, int]] = (), *,
+                 only_allowed: bool = False) -> None:
         self.destinations = destinations
         self.allowed = {(str(ipaddress.ip_address(host)), int(port)) for host, port in allowed}
+        self.only_allowed = only_allowed
         self.active = True
         self.refused: list[str] = []
         self._lock = threading.Lock()
@@ -53,6 +59,8 @@ class EgressGuard:
             return f"{host} is not an address"
         if (address, port) in self.allowed:
             return None
+        if self.only_allowed:
+            return f"{address}:{port} is not the database or the configured local model"
         return self.destinations.check_address(address)
 
     def __call__(self, event: str, args: tuple) -> None:
@@ -110,10 +118,11 @@ def infrastructure(settings: Settings) -> list[tuple[str, int]]:
     return allowed
 
 
-def install(settings: Settings, *, extra: Iterable[tuple[str, int]] = ()) -> EgressGuard:
+def install(settings: Settings, *, extra: Iterable[tuple[str, int]] = (), only_allowed: bool = False) -> EgressGuard:
     """Install the guard for this process (once); later calls return the installed guard."""
     global _installed
     if _installed is None:
-        _installed = EgressGuard(settings.scope.destination_policy(), [*infrastructure(settings), *extra])
+        _installed = EgressGuard(settings.scope.destination_policy(), [*infrastructure(settings), *extra],
+                                 only_allowed=only_allowed)
         sys.addaudithook(_installed)
     return _installed

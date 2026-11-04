@@ -1,0 +1,9 @@
+[
+  {"id": "00000000-0000-4000-8000-0000000000e1", "approved_revision": 1,
+   "content": {"title": "DOMPurify output written to the DOM", "category": "dom_xss_sink", "verdict": "false_positive",
+               "explanation": "In this project, HTML passed through DOMPurify.sanitize before it is assigned is not a DOM XSS issue.",
+               "snippet": "const clean = DOMPurify.sanitize(markdownHtml, { USE_PROFILES: { html: true } });"},
+   "conditions": {"category": "dom_xss_sink", "technologies": [], "path_pattern": "", "fingerprint": "x",
+                  "identifiers": ["DOMPurify", "sanitize", "markdownHtml", "USE_PROFILES"], "context": "sanitized preview",
+                  "keywords": ["sanitize"], "review_by": null}}
+]

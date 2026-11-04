@@ -4,6 +4,7 @@
     watchtower-worker drain                 # run every due job and notification, then exit
     watchtower-worker schedule --every 6h   # enqueue this slot's scheduled runs, then exit
     watchtower-worker recover               # finalize runs that stopped without a worker
+    watchtower-worker ai [--drain]          # AI analysis worker: reaches only the database and the local model
 """
 from __future__ import annotations
 
@@ -45,6 +46,8 @@ def main(argv: list[str] | None = None) -> int:
     every = commands.add_parser("schedule", help="enqueue the current slot's scheduled runs")
     every.add_argument("--every", type=interval, default=timedelta(hours=6))
     commands.add_parser("recover", help="finalize runs that stopped without a worker")
+    ai = commands.add_parser("ai", help="run AI analyses (reaches only the database and the configured local model)")
+    ai.add_argument("--drain", action="store_true", help="run due analyses, then exit")
     args = parser.parse_args(argv)
 
     settings = load_settings(args.profile)
@@ -59,6 +62,18 @@ def main(argv: list[str] | None = None) -> int:
             jobs = Worker(database, scope, settings=settings).run_until_idle()
             sent = Notifier(database, settings).run_until_idle()
             print(f"ran {jobs} jobs, sent {sent} notifications")
+        elif args.command == "ai":
+            from watchtower.services.ai.endpoint import EndpointRefused
+            from watchtower.workers.ai import serve_ai
+            if not settings.ai.enabled:
+                print("AI review is disabled (ai.enabled is false); nothing to run", file=sys.stderr)
+                return 2
+            try:
+                ran = serve_ai(database, scope, settings, drain=args.drain)
+            except EndpointRefused as error:
+                print(f"watchtower-worker: AI endpoint refused: {error}", file=sys.stderr)
+                return 2
+            print(f"ran {ran} AI analyses")
         elif args.command == "schedule":
             started = schedule_due(database, RunService(database, scope, settings=settings), interval=args.every)
             print(f"{len(started)} scheduled runs queued or already queued")

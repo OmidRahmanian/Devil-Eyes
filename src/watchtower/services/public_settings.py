@@ -9,6 +9,7 @@ def public_settings(settings, rules):
                          "evidence_retention_days": settings.pipeline.evidence_retention_days,
                          "http_schemes": settings.pipeline.http_schemes,
                          "confirm_changes": settings.pipeline.confirm_changes},
+            "ai": settings.ai.model_dump(),
             "notifications": [{"name": d.name, "kind": d.kind, "enabled": d.enabled, "events": d.events}
                               for d in settings.notifications.destinations],
             "rules": [{"id": r.id, "version": r.version, "sha256": r.sha256, "approved": r.approved}

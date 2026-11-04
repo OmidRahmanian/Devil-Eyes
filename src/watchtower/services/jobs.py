@@ -71,7 +71,14 @@ PHASES: tuple[RunPhase, ...] = (RunPhase.DISCOVERY, RunPhase.DNS, RunPhase.HTTP,
 PHASE_KINDS = {phase: f"monitor.{phase.value}" for phase in PHASES}
 FINALIZE = "monitor.finalize"
 RETEST = "checks.retest"
-JOB_KINDS = (*PHASE_KINDS.values(), FINALIZE, RETEST)
+# Optional AI review (watchtower.services.ai). Collection makes target requests under scope like any
+# scan job, so regular workers run it. Analysis only talks to the local model: a separate AI worker,
+# with an egress guard that reaches nothing else, claims AI_ANALYZE (see AI_JOB_KINDS).
+AI_COLLECT = "ai.collect"
+AI_ANALYZE = "ai.analyze"
+AI_KINDS = (AI_COLLECT, AI_ANALYZE)
+AI_JOB_KINDS = (AI_ANALYZE,)
+JOB_KINDS = (*PHASE_KINDS.values(), FINALIZE, RETEST, AI_COLLECT)
 ACTIVE = (JobStatus.QUEUED, JobStatus.RUNNING)
 
 
@@ -127,6 +134,7 @@ class PipelineAdapters:
     """
 
     process_runner: Callable[..., Any] | None = None
+    ai_client: Any | None = None  # an OllamaClient (or a test double) for AI analysis
     resolver: Resolver | None = None
     prober: Callable[[ScopePolicy], Any] | None = None  # returns an object with HttpProber.probe
     ruleset: RuleSet | None = None
@@ -140,12 +148,16 @@ class PipelineAdapters:
 
 
 def _steps(meta: Mapping[str, Any]) -> list[str]:
+    if str(meta.get("kind", "")).startswith("ai."):
+        return [step for step in meta["steps"] if step in AI_KINDS]
     if meta.get("kind") == "retest":
         return [RETEST, FINALIZE]
     return [PHASE_KINDS[RunPhase(phase)] for phase in meta["phases"]] + [FINALIZE]
 
 
 def _concurrency_key(kind: str) -> str | None:
+    if kind in AI_KINDS:
+        return kind
     return kind.removeprefix("monitor.") if kind in PHASE_KINDS.values() else ("checks" if kind == RETEST else None)
 
 
@@ -245,13 +257,21 @@ class Pipeline:
                 # the race with its predecessor's completion commit.
                 return {"notifications": 0, "pending_predecessors": True}
             return {"notifications": self.finalize(job.project_id, job.run_id)}
+        if job.kind == AI_ANALYZE:
+            from watchtower.services.ai.analyze import run_analysis
+            result = run_analysis(self, job, token)
+            self._enqueue_next(job, token)
+            return result
         policy = LiveScopePolicy(self.scope, job.project_id, job.scope_revision_id)
         from watchtower.services.budgets import RequestLimiter
         limits = self.settings.scope.model_copy(update={"max_requests_per_run": min(self.settings.scope.max_requests_per_run,
                                                                                  policy.execution_policy.max_requests_per_run)})
         policy.limiter = RequestLimiter(self.db, limits, job.project_id, job.run_id, token,
                                        lambda host: self.scope.policy_for_revision(job.project_id, job.scope_revision_id).check_target(host, port=None))
-        if job.kind == RETEST:
+        if job.kind == AI_COLLECT:
+            from watchtower.services.ai.collect import run_collection
+            result = run_collection(self, job, policy, token)
+        elif job.kind == RETEST:
             result = self._retest(job, policy, token)
         else:
             phase = RunPhase(job.kind.removeprefix("monitor."))
@@ -589,6 +609,11 @@ class Pipeline:
             active = [j for j in run_jobs if j.status in ACTIVE and j.kind != FINALIZE]
             if not run_jobs or active:
                 return 0
+            if str(run_jobs[0].payload["run"].get("kind", "")).startswith("ai."):
+                # AI runs send no alerts; settle any analysis whose run stopped early.
+                from watchtower.services.ai.analyze import settle_run
+                settle_run(uow, run_jobs)
+                return 0
             snapshots = list(uow.phase_snapshots.list_for_run(run_id))
             found = [change for snapshot in snapshots for change in changes.alertable(snapshot)]
             failed = [{"kind": j.kind, "error": (j.last_error or "")[:500]}
@@ -649,7 +674,7 @@ class RunSummary:
     created_at: datetime
     status: str  # queued | running | succeeded | partial | failed | cancelled
     scope_revision_id: UUID
-    kind: str  # scan | retest
+    kind: str  # scan | retest | ai.collect | ai.analyze
     requested_by: str | None
     reason: str
     targets: tuple[str, ...]
@@ -681,7 +706,7 @@ def summarize(run_jobs: Sequence[Job], snapshots: Sequence[PhaseSnapshot]) -> Ru
         status = "cancelled"
     elif JobStatus.FAILED in statuses or any(s.status is PhaseStatus.FAILED for s in snapshots):
         status = "failed"  # a job gave up, or a phase observed nothing
-    elif any(s.status is PhaseStatus.PARTIAL or s.comparison is PhaseComparison.UNCERTAIN for s in snapshots):
+    elif any(s.status is PhaseStatus.PARTIAL or s.comparison is PhaseComparison.UNCERTAIN for s in snapshots)             or any((job.result or {}).get("partial") for job in run_jobs):
         status = "partial"  # real coverage with gaps: pending rules, some hosts unobservable"
     else:
         status = "succeeded"
@@ -788,6 +813,26 @@ class RunService:
             raise ValueError("idempotency key must contain 1-200 characters")
         run_id = uuid5(NAMESPACE_URL, f"watchtower:{project_id}:request:{actor.principal.id}:{idempotency_key}") if idempotency_key else None
         return self._start(project_id, policy, meta, run_id=run_id, reuse_active=reuse_active, request_id=run_id)
+
+    def start_ai_run(self, project_id: UUID, *, actor: ProjectContext, kind: str, steps: Sequence[str],
+                     targets: list[str] | None = None, extra: Mapping[str, Any] | None = None, reason: str = "",
+                     run_id: UUID | None = None) -> RunSummary:
+        """Queue an AI collection or analysis run pinned to the current scope revision.
+
+        Collection targets are checked like a scan's; an analysis run sends no
+        target traffic and only records the scope roots it relates to.
+        """
+        _require(actor, project_id, Permission.OPERATE)
+        if kind not in AI_KINDS or not steps or any(step not in AI_KINDS for step in steps):
+            raise ValueError("unknown AI run kind or steps")
+        self.scope.invalidate(project_id)
+        policy = self.scope.current_policy(project_id)
+        if policy.revision is None:
+            raise ScopeViolation(policy.check_target("scope.example", port=None))
+        chosen = self._targets(policy, targets) if kind == AI_COLLECT else scope_roots(policy)
+        meta = {"kind": kind, "requested_by": str(actor.principal.id), "reason": reason, "targets": chosen,
+                "steps": list(steps)}
+        return self._start(project_id, policy, meta, run_id=run_id, extra=extra, request_id=run_id)
 
     def start_scheduled(self, project_id: UUID, *, slot: str) -> RunSummary | None:
         """Start the run for schedule slot ``slot`` (for example ``"2026-10-30T06"``); repeats are no-ops."""
@@ -899,7 +944,7 @@ def unfinalized_runs(database: Database, *, within: timedelta = timedelta(days=1
 
 
 __all__ = [
-    "FINALIZE", "JOB_KINDS", "PHASES", "PHASE_KINDS", "RETEST", "CancelToken", "JobCancelled", "PhaseState",
+    "AI_ANALYZE", "AI_COLLECT", "AI_JOB_KINDS", "AI_KINDS", "FINALIZE", "JOB_KINDS", "PHASES", "PHASE_KINDS", "RETEST", "CancelToken", "JobCancelled", "PhaseState",
     "Pipeline", "PipelineAdapters", "RunDetail", "RunService", "RunSummary", "scope_roots", "summarize",
     "unfinalized_runs",
 ]

@@ -43,6 +43,8 @@ from watchtower.api.runs import RunsPort, default_runs
 from watchtower.api.storage import default_evidence_root
 from watchtower.config.settings import Settings
 from watchtower.domain.errors import (
+    AiDisabled,
+    AiInvalidAction,
     AuthenticationFailed,
     InvalidScopeRule,
     InvalidTarget,
@@ -141,6 +143,8 @@ _STATUS: list[tuple[type[Exception], int, str]] = [
     (InvalidScopeRule, 422, "invalid_scope"),
     (InvalidTarget, 422, "invalid_target"),
     (RunsUnavailable, 503, "runs_unavailable"),
+    (AiDisabled, 409, "ai_disabled"),
+    (AiInvalidAction, 409, "invalid_action"),
 ]
 
 
@@ -600,6 +604,8 @@ def create_app(
     app.include_router(project_router)
     from watchtower.api.operations import router as operations_router
     app.include_router(operations_router)
+    from watchtower.api.ai import router as ai_router
+    app.include_router(ai_router)
 
     root = frontend or default_frontend_root()
     if (root / "index.html").is_file():

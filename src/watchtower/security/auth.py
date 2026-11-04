@@ -30,7 +30,8 @@ class Permission(StrEnum):
     VIEW = "view"  # read inventory, findings and scope
     OPERATE = "operate"  # queue jobs, triage findings
     MANAGE_SCOPE = "manage_scope"  # publish and revoke scope revisions
-    MANAGE_PROJECT = "manage_project"  # memberships, tokens, archive
+    MANAGE_PROJECT = "manage_project"  # memberships, tokens, archive, AI and retention settings
+    MANAGE_MEMORY = "manage_memory"  # approve, reject, edit, disable and re-enable AI project-memory examples
 
 
 class ProjectRole(StrEnum):

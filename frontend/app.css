@@ -155,3 +155,12 @@ pre.captured { white-space: pre-wrap; background: var(--muted-bg); padding: 12px
   .facts { grid-template-columns: 1fr; }
   .facts dt { margin-top: 6px; }
 }
+
+/* AI review */
+.citation { margin: 8px 0; }
+.citation pre { margin: 4px 0; padding: 8px; background: var(--muted-bg); border-radius: 6px; overflow-x: auto; white-space: pre-wrap; word-break: break-word; }
+mark { background: var(--warn-bg); color: var(--text); padding: 0 2px; }
+.muted-panel { opacity: 0.8; border-style: dashed; }
+.hint.warn { color: var(--warn); }
+label.check { display: flex; gap: 6px; align-items: center; }
+textarea { font: inherit; color: inherit; background: var(--surface); border: 1px solid var(--line); border-radius: 6px; padding: 6px 12px; width: 100%; min-height: 4em; }

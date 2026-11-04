@@ -36,6 +36,8 @@ from watchtower.api.storage import default_evidence_root
 from watchtower.config import load_settings
 from watchtower.config.settings import Settings
 from watchtower.domain.errors import (
+    AiDisabled,
+    AiInvalidAction,
     AuthenticationFailed,
     InvalidScopeRule,
     InvalidTarget,
@@ -949,6 +951,9 @@ def build_parser() -> argparse.ArgumentParser:
     correlate.add_argument("--limit", type=int, choices=range(1, 201), default=50, metavar="1-200")
     correlate.add_argument("--after-asset")
 
+    from watchtower.cli_ai import register as register_ai
+    register_ai(commands, add)
+
     serve = add("serve", cmd_serve, "run the API and dashboard")
     serve.add_argument("--host", default="127.0.0.1")
     serve.add_argument("--port", type=int, default=8080)
@@ -964,6 +969,8 @@ def _watch_options(parser: argparse.ArgumentParser, *, follow_flag: bool = False
 
 
 ERRORS: list[tuple[type[Exception], int, str]] = [
+    (AiDisabled, 1, "AI review is disabled"),
+    (AiInvalidAction, 1, "not allowed"),
     (AuthenticationFailed, 2, "authentication failed"),
     (PermissionDenied, 2, "permission denied"),
     (NotFound, 1, "not found"),

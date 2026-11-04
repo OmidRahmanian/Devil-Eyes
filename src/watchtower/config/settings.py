@@ -201,6 +201,47 @@ class IntelligenceSettings(_Section):
         return value
 
 
+class AiSettings(_Section):
+    """The optional local AI review (``watchtower.services.ai``). Off unless ``enabled``.
+
+    ``endpoint`` must be loopback, or a private/LAN address the owner confirms
+    with ``allow_private_endpoint``. The host ``windows-host`` means the Windows
+    host seen from WSL (its address changes between reboots and is looked up
+    each time). Public hosts, other schemes and URLs with credentials are refused.
+    """
+
+    enabled: bool = False
+    endpoint: str = "http://127.0.0.1:11434"
+    allow_private_endpoint: bool = False
+    model: str = "qwen3:8b-q4_K_M"  # verified against the endpoint's installed models before every use
+    request_timeout_seconds: float = Field(default=180.0, ge=5, le=3600)
+    connect_timeout_seconds: float = Field(default=5.0, ge=0.5, le=120)
+    num_ctx: int = Field(default=8192, ge=2048, le=262_144)
+    max_output_tokens: int = Field(default=1536, ge=128, le=16_384)
+    temperature: float = Field(default=0.1, ge=0, le=2)
+    thinking: bool = False
+    max_concurrent_analyses: int = Field(default=1, ge=1, le=8)
+    # Per-review limits.
+    max_files: int = Field(default=20, ge=1, le=500)
+    max_file_bytes: int = Field(default=512 * 1024, ge=1024, le=16 * 1024 * 1024)
+    max_total_bytes: int = Field(default=4 * 1024 * 1024, ge=1024, le=256 * 1024 * 1024)
+    max_chunks: int = Field(default=24, ge=1, le=1000)
+    max_review_seconds: int = Field(default=1800, ge=30, le=86_400)
+    max_fetch_depth: int = Field(default=1, ge=0, le=3)
+    # Project memory retrieval.
+    max_examples: int = Field(default=3, ge=0, le=10)
+    example_token_budget: int = Field(default=800, ge=0, le=8000)
+    retention_days: int = Field(default=30, ge=1, le=3650)  # retained bodies and collected scripts
+
+    @field_validator("endpoint")
+    @classmethod
+    def _endpoint_shape(cls, value: str) -> str:
+        from watchtower.services.ai.endpoint import parse_endpoint
+
+        parse_endpoint(value)
+        return value.rstrip("/")
+
+
 class Settings(_Section):
     profile: str = "development"
     log_level: str = "INFO"
@@ -211,6 +252,7 @@ class Settings(_Section):
     notifications: NotificationSettings = NotificationSettings()
     pipeline: PipelineSettings = PipelineSettings()
     intelligence: IntelligenceSettings = IntelligenceSettings()
+    ai: AiSettings = AiSettings()
 
 
 def load_settings(profile: str | None = None, *, environ: Mapping[str, str] | None = None) -> Settings:

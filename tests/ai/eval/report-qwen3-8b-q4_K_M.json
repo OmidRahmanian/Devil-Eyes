@@ -1,0 +1,224 @@
+[
+  {
+    "mode": "without memory",
+    "model": "qwen3:8b-q4_K_M",
+    "prompt_version": "review-v1",
+    "seconds": 51.9,
+    "totals": {
+      "expected": 4,
+      "true_positives": 4,
+      "missed": 0,
+      "false_positives": 5,
+      "unsupported": 0,
+      "citations": 11,
+      "verified_citations": 11,
+      "citation_verification_rate": 1.0
+    },
+    "files": {
+      "safe_origin_checked.js": {
+        "expected": 0,
+        "true_positives": 0,
+        "missed": 0,
+        "false_positives": 1,
+        "unsupported": 0,
+        "citations": 1,
+        "verified_citations": 1,
+        "errors": [],
+        "titles": [
+          "DOM XSS sink"
+        ]
+      },
+      "safe_sanitized.js": {
+        "expected": 0,
+        "true_positives": 0,
+        "missed": 0,
+        "false_positives": 1,
+        "unsupported": 0,
+        "citations": 1,
+        "verified_citations": 1,
+        "errors": [],
+        "titles": [
+          "DOM XSS Sink"
+        ]
+      },
+      "safe_textcontent.js": {
+        "expected": 0,
+        "true_positives": 0,
+        "missed": 0,
+        "false_positives": 1,
+        "unsupported": 0,
+        "citations": 1,
+        "verified_citations": 1,
+        "errors": [],
+        "titles": [
+          "DOM XSS sink"
+        ]
+      },
+      "vuln_dom_xss.js": {
+        "expected": 1,
+        "true_positives": 1,
+        "missed": 0,
+        "false_positives": 0,
+        "unsupported": 0,
+        "citations": 1,
+        "verified_citations": 1,
+        "errors": [],
+        "titles": [
+          "DOM XSS Sink"
+        ]
+      },
+      "vuln_open_redirect.js": {
+        "expected": 1,
+        "true_positives": 1,
+        "missed": 0,
+        "false_positives": 0,
+        "unsupported": 0,
+        "citations": 1,
+        "verified_citations": 1,
+        "errors": [],
+        "titles": [
+          "Open redirect"
+        ]
+      },
+      "vuln_postmessage.js": {
+        "expected": 1,
+        "true_positives": 1,
+        "missed": 0,
+        "false_positives": 1,
+        "unsupported": 0,
+        "citations": 2,
+        "verified_citations": 2,
+        "errors": [],
+        "titles": [
+          "DOM XSS Sink via message event handler",
+          "DOM XSS Sink via eval()"
+        ]
+      },
+      "vuln_token_storage.js": {
+        "expected": 1,
+        "true_positives": 1,
+        "missed": 0,
+        "false_positives": 1,
+        "unsupported": 0,
+        "citations": 4,
+        "verified_citations": 4,
+        "errors": [],
+        "titles": [
+          "Insecure storage of tokens",
+          "Sensitive data in client"
+        ]
+      }
+    }
+  },
+  {
+    "mode": "with memory",
+    "model": "qwen3:8b-q4_K_M",
+    "prompt_version": "review-v1",
+    "seconds": 6.5,
+    "totals": {
+      "expected": 4,
+      "true_positives": 4,
+      "missed": 0,
+      "false_positives": 5,
+      "unsupported": 0,
+      "citations": 11,
+      "verified_citations": 11,
+      "citation_verification_rate": 1.0
+    },
+    "files": {
+      "safe_origin_checked.js": {
+        "expected": 0,
+        "true_positives": 0,
+        "missed": 0,
+        "false_positives": 1,
+        "unsupported": 0,
+        "citations": 1,
+        "verified_citations": 1,
+        "errors": [],
+        "titles": [
+          "DOM XSS sink"
+        ]
+      },
+      "safe_sanitized.js": {
+        "expected": 0,
+        "true_positives": 0,
+        "missed": 0,
+        "false_positives": 1,
+        "unsupported": 0,
+        "citations": 1,
+        "verified_citations": 1,
+        "errors": [],
+        "titles": [
+          "Potential DOM XSS sink with sanitized content"
+        ]
+      },
+      "safe_textcontent.js": {
+        "expected": 0,
+        "true_positives": 0,
+        "missed": 0,
+        "false_positives": 1,
+        "unsupported": 0,
+        "citations": 1,
+        "verified_citations": 1,
+        "errors": [],
+        "titles": [
+          "DOM XSS sink"
+        ]
+      },
+      "vuln_dom_xss.js": {
+        "expected": 1,
+        "true_positives": 1,
+        "missed": 0,
+        "false_positives": 0,
+        "unsupported": 0,
+        "citations": 1,
+        "verified_citations": 1,
+        "errors": [],
+        "titles": [
+          "DOM XSS Sink"
+        ]
+      },
+      "vuln_open_redirect.js": {
+        "expected": 1,
+        "true_positives": 1,
+        "missed": 0,
+        "false_positives": 0,
+        "unsupported": 0,
+        "citations": 1,
+        "verified_citations": 1,
+        "errors": [],
+        "titles": [
+          "Open redirect"
+        ]
+      },
+      "vuln_postmessage.js": {
+        "expected": 1,
+        "true_positives": 1,
+        "missed": 0,
+        "false_positives": 1,
+        "unsupported": 0,
+        "citations": 2,
+        "verified_citations": 2,
+        "errors": [],
+        "titles": [
+          "DOM XSS Sink via message event handler",
+          "DOM XSS Sink via eval()"
+        ]
+      },
+      "vuln_token_storage.js": {
+        "expected": 1,
+        "true_positives": 1,
+        "missed": 0,
+        "false_positives": 1,
+        "unsupported": 0,
+        "citations": 4,
+        "verified_citations": 4,
+        "errors": [],
+        "titles": [
+          "Insecure storage of tokens",
+          "Sensitive data in client"
+        ]
+      }
+    }
+  }
+]

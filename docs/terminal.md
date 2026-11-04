@@ -53,6 +53,10 @@ private and backed up if you need these credentials later.
 | Open dashboard | Reuses a running local server or opens a server window, then opens the browser |
 | Switch saved targets / projects | Offers numbered accessible projects and token-file selection; also available inside Start scan |
 | Settings and help | Changes profile or explains credentials, legacy mode and noninteractive commands |
+| a) AI security review | Optional, local-only review of collected scripts and scan evidence, with feedback and project memory. Off by default; see [ai-review.md](ai-review.md) |
+
+Browse findings > Inspect finding also offers **Explain this finding**, which
+starts an AI review of that finding's stored evidence after the same preview.
 
 **0** returns from menus; **b** returns from text fields. Enter accepts the shown
 default. Ctrl+C returns to Home during an action, or stops a progress viewer.

@@ -29,6 +29,11 @@ function el(tag, attrs, ...children) {
   return node;
 }
 
+// replaceChildren with el()'s rules: nested arrays are flattened and null/false/undefined are skipped.
+function fill(node, ...children) {
+  node.replaceChildren(...el("div", {}, ...children).childNodes);
+}
+
 function text(value) {
   return value === undefined || value === null || value === "" ? "-" : String(value);
 }
@@ -621,6 +626,297 @@ function publishForm() {
   });
   return form;
 }
+
+// ---- AI review -----------------------------------------------------------
+//
+// Optional, local-only AI review. Candidates, quotes, explanations and examples
+// are untrusted data (they come from scanned sites and from a model) and are
+// only ever inserted as text. The server enforces every permission; the
+// buttons shown here only follow the role.
+
+const MEMORY_SENTENCE = "Approved examples can guide future reviews in this project. This does not retrain the model.";
+const AI_STATUS = { completed: "ok", partial: "warn", failed: "bad", cancelled: "muted", queued: "info", running: "info" };
+const CATEGORY_LABELS = {
+  dom_xss_sink: "DOM XSS sink", open_redirect: "Open redirect", sensitive_data_in_client: "Sensitive data in client",
+  insecure_token_storage: "Insecure storage of tokens", weak_csp: "Weak CSP", cors_misconfiguration: "CORS misconfiguration",
+  outdated_library: "Outdated library", exposed_endpoint: "Exposed endpoint", debug_artifact: "Debug or test artifact",
+  other: "Other",
+};
+const CLAIM_LABELS = { observed_fact: "observed fact", model_inference: "model inference",
+  user_reviewed: "user-reviewed conclusion", verified_by_check: "verified by an existing check" };
+
+function aiBadge(status) {
+  return badge(status.toUpperCase(), AI_STATUS[status] || "muted");
+}
+
+function categoryLabel(category) {
+  return CATEGORY_LABELS[category] || category;
+}
+
+function aiTabs(active) {
+  const tabs = [["ai", "Results"], ["aiMemory", "Approved examples"]];
+  if (can("manage_memory")) tabs.splice(1, 0, ["aiPending", "Awaiting approval"]);
+  tabs.push(["aiAdvanced", "Model status and Advanced"]);
+  return el("div", { class: "controls" }, tabs.map(([view, label]) =>
+    el("button", { class: view === active ? "active" : "", onclick: () => show(view) }, label)));
+}
+
+async function aiStart(kind) {
+  try {
+    if (kind === "collect") {
+      if (!confirm("Collect in-scope pages and scripts for review? Third-party scripts are recorded, not fetched, and nothing is executed.")) return;
+      const result = await api(projectPath("/ai/collections"), { method: "POST", body: { review: true } });
+      notice(`Collection run ${result.run.run_id.slice(0, 8)} queued; a review follows. An AI worker must be running.`, "ok");
+    } else {
+      const status = await api(projectPath("/ai/status"));
+      const result = await api(projectPath("/ai/reviews"), { method: "POST", body: { use_model: status.enabled } });
+      notice(`Review ${String(result.analysis_id).slice(0, 8)} queued` + (status.enabled ? "." : " (pre-analysis only: AI is disabled)."), "ok");
+    }
+    show("ai");
+  } catch (error) { notice(error.message, "bad"); }
+}
+
+async function aiPreview(root) {
+  const plan = await api(projectPath("/ai/preview"), { method: "POST", body: {} });
+  root.hidden = false;
+  fill(root,
+    el("h2", {}, "Preview what will be sent"),
+    el("p", {}, plan.visible),
+    tableOf(["Kind", "URL", "How it was obtained", "Bytes", "Redacted", "Sent"], plan.files.map((f) => el("tr", {},
+      el("td", {}, f.kind), el("td", { class: "mono" }, f.url), el("td", {}, f.origin), el("td", {}, String(f.size_bytes)),
+      el("td", {}, String(f.redactions)), el("td", {}, f.sent ? "yes" : "no"))), "Nothing to review yet."),
+    el("p", { class: "hint" }, `${plan.chunks} chunk(s), about ${plan.token_estimate} tokens, ${plan.redactions} redaction(s). `
+      + `Model ${plan.model}, ${plan.num_ctx}-token context. Content goes only to the configured local model.`),
+    plan.files.length ? el("button", { onclick: () => aiStart("review") }, plan.enabled ? "Send to the local model" : "Run pre-analysis only") : null);
+}
+
+views.ai = async (root) => {
+  const [status, results] = await Promise.all([api(projectPath("/ai/status")), api(projectPath("/ai/reviews?limit=50"))]);
+  const previewBox = el("div", { class: "panel" });
+  const actions = can("operate") ? el("div", { class: "controls" },
+    el("button", { onclick: () => aiPreview(previewBox).catch((e) => notice(e.message, "bad")) }, "Review latest scan"),
+    status.enabled ? el("button", { onclick: () => aiStart("collect") }, "Collect scripts for review") : null) : null;
+  fill(root,
+    heading("AI Review", badge(status.enabled ? "ENABLED" : "DISABLED", status.enabled ? "ok" : "muted")),
+    aiTabs("ai"),
+    status.enabled ? null : el("p", { class: "panel warn" }, "AI review is disabled. Pre-analysis still works; scans and findings are unaffected."),
+    el("p", { class: "hint" }, `Model ${status.model}. Project memory: ${status.memory.approved} approved example(s). ${MEMORY_SENTENCE}`),
+    actions, previewBox,
+    tableOf(["Review", "Status", "Mode", "Supported", "Unsupported", "Outdated", "Created"], results.map((r) =>
+      el("tr", { class: r.status === "failed" ? "row-bad" : "" },
+        el("td", {}, el("button", { onclick: () => show("aiReview", r.id) }, r.id.slice(0, 8))),
+        el("td", {}, aiBadge(r.status)), el("td", {}, r.mode === "model" ? "model" : "pre-analysis only"),
+        el("td", {}, String(r.candidates.supported)), el("td", {}, String(r.candidates.unsupported)),
+        el("td", {}, r.outdated ? badge("MAY BE OUTDATED", "warn") : ""), el("td", {}, when(r.created_at)))),
+    "No AI reviews yet."));
+  previewBox.hidden = true;
+};
+
+function highlighted(citation) {
+  return el("div", { class: "citation" },
+    el("div", { class: "hint" }, `line ${citation.line}${citation.line_end !== citation.line ? `-${citation.line_end}` : ""}, `
+      + `bytes ${citation.byte_start}-${citation.byte_end}`
+      + (citation.location_corrected ? ` (model said line ${citation.stated_line}; corrected)` : "")
+      + (citation.contains_redaction ? ", contains redacted text" : "")),
+    el("pre", {}, el("mark", {}, citation.quote)),
+    el("div", { class: "hint mono" }, `redacted sha256 ${text(citation.redacted_sha256)} / original sha256 ${text(citation.original_sha256)}`));
+}
+
+function feedbackForm(candidate) {
+  const form = el("form", { class: "panel" },
+    el("h3", {}, "Your feedback"),
+    el("label", {}, "Feedback",
+      el("select", { name: "kind" },
+        el("option", { value: "looks_correct" }, "Looks correct (your review, not a verification)"),
+        el("option", { value: "false_positive" }, "False positive"),
+        el("option", { value: "edit" }, "Edit analysis"))),
+    el("label", {}, "Reason (required for a false positive: why does it not apply here?)", el("textarea", { name: "reason", maxlength: 4000 })),
+    el("label", {}, "Corrected explanation (edit only)", el("textarea", { name: "explanation", maxlength: 4000 })),
+    el("label", {}, "Corrected category (edit only)", el("select", { name: "category" },
+      el("option", { value: "" }, "unchanged"),
+      Object.entries(CATEGORY_LABELS).map(([value, label]) => el("option", { value }, label)))),
+    el("label", {}, "When does it apply? (edit only)", el("input", { name: "applicability", maxlength: 4000 })),
+    el("label", { class: "check" }, el("input", { type: "checkbox", name: "memory" }), " Submit as a project-memory example for approval"),
+    el("p", { class: "hint" }, MEMORY_SENTENCE),
+    el("label", {}, "Context for the example (optional)", el("input", { name: "context", maxlength: 4000 })),
+    el("button", { type: "submit" }, "Submit feedback"));
+  form.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const value = (name) => form.elements[name].value.trim();
+    try {
+      const result = await api(projectPath(`/ai/candidates/${encodeURIComponent(candidate.id)}/feedback`), {
+        method: "POST",
+        body: { kind: value("kind"), reason: value("reason"), explanation: value("explanation") || null,
+          category: value("category") || null, applicability: value("applicability") || null,
+          submit_memory: form.elements.memory.checked, context: value("context") },
+      });
+      notice(result.example_id ? "Feedback recorded and submitted for approval. The finding's status is unchanged."
+        : "Feedback recorded. The finding's status is unchanged.", "ok");
+      show("aiReview", candidate.analysis);
+    } catch (error) { notice(error.message, "bad"); }
+  });
+  return form;
+}
+
+function candidateCard(candidate, analysisId) {
+  const data = candidate.data;
+  return el("div", { class: `panel ${candidate.supported ? "" : "muted-panel"}` },
+    el("h2", {}, candidate.supported ? "" : "Unsupported: ", data.title || candidate.title),
+    el("p", {}, badge(categoryLabel(candidate.category), "info"), " ", badge(`confidence ${candidate.confidence}`, "muted"),
+      " ", badge(`citations ${candidate.citation_status.replace("_", " ")}`, candidate.citation_status === "verified" ? "ok" : "warn")),
+    candidate.supported ? null : el("p", { class: "hint" }, "No verified evidence, so this is not shown as an issue."),
+    el("p", {}, data.explanation),
+    el("p", { class: "hint" }, `Confidence reason: ${text(data.confidence_reason)}`),
+    data.affected ? fact("Affected", data.affected) : null,
+    (data.citations || []).map(highlighted),
+    (data.removed_citations || []).length ? el("p", { class: "hint" }, `Removed ${data.removed_citations.length} citation(s) that were not found in the reviewed content.`) : null,
+    el("div", {}, (data.claims || []).map((claim) => el("div", {}, badge(CLAIM_LABELS[claim.claim_type] || claim.claim_type, claim.claim_type === "observed_fact" ? "ok" : "muted"), " ", claim.text))),
+    (data.assumptions || []).length ? el("div", {}, el("h3", {}, "Assumptions"), el("ul", {}, data.assumptions.map((a) => el("li", {}, a)))) : null,
+    (data.missing_context || []).length ? el("div", {}, el("h3", {}, "Missing context"), el("ul", {}, data.missing_context.map((a) => el("li", {}, a)))) : null,
+    (data.validation_steps || []).length ? el("div", {}, el("h3", {}, "Suggested manual checks (on your own site)"), el("ul", {}, data.validation_steps.map((a) => el("li", {}, a)))) : null,
+    data.suggested_severity && data.suggested_severity !== "none"
+      ? el("p", { class: "hint" }, `Suggested severity: ${data.suggested_severity} (unverified; never written to findings)`) : null,
+    (data.flags || []).map((flag) => el("p", { class: "hint warn" }, flag)),
+    candidate.matched_finding_id ? el("p", {}, el("button", { onclick: () => show("finding", candidate.matched_finding_id) }, "Related finding")) : null,
+    (data.examples_used || []).length ? el("div", {}, el("h3", {}, "Project memory used"), el("ul", {}, data.examples_used.map((used) =>
+      el("li", {}, `Example ${used.id.slice(0, 8)} revision ${used.revision}. Why it was used: ${text(used.why_retrieved)}. How it affected the result: ${text(used.effect)}`)))) : null,
+    candidate.feedback.length ? el("div", {}, el("h3", {}, "Feedback"), el("ul", {}, candidate.feedback.map((f) =>
+      el("li", {}, `${f.kind.replace("_", " ")} ${when(f.created_at)}` + (f.memory_state ? `, memory example ${f.memory_state}` : "") + (f.reason ? `: ${f.reason}` : ""))))) : null,
+    can("operate") ? feedbackForm({ ...candidate, analysis: analysisId }) : null);
+}
+
+views.aiReview = async (root, id) => {
+  const detail = await api(projectPath(`/ai/reviews/${encodeURIComponent(id)}`));
+  const coverage = detail.coverage || {};
+  const facts = (detail.preanalysis || {}).facts || [];
+  const reanalyze = can("operate") ? el("button", { onclick: async () => {
+    try {
+      await api(projectPath("/ai/reviews"), { method: "POST", body: { reanalysis_of: detail.id } });
+      notice("Reanalysis queued; this review stays unchanged.", "ok");
+    } catch (error) { notice(error.message, "bad"); }
+  } }, "Request reanalysis") : null;
+  fill(root,
+    heading(`AI review ${detail.id.slice(0, 8)}`, aiBadge(detail.status), reanalyze),
+    aiTabs("ai"),
+    detail.outdated ? el("p", { class: "panel warn" }, `May be outdated: ${text(detail.outdated_reason)}. Request a reanalysis to refresh it.`) : null,
+    detail.error ? el("p", { class: "panel bad" }, detail.error) : null,
+    el("div", { class: "panel" },
+      el("h2", {}, "What this review could and could not see"),
+      el("p", {}, coverage.visible || ""),
+      el("ul", {}, [...(coverage.not_visible || []), ...(coverage.model_notes || []), coverage.redaction_note].filter(Boolean)
+        .map((line) => el("li", {}, line))),
+      (coverage.skipped || []).length ? el("p", { class: "hint" }, `${coverage.skipped.length} part(s) left out: `
+        + coverage.skipped.slice(0, 5).map((s) => `${s.url || "scan evidence"} lines ${s.lines.join("-")} (${s.reason})`).join("; ")) : null,
+      (coverage.conflicting_examples || []).length ? el("p", { class: "hint warn" }, "Conflicting approved examples were not used; an owner should review them.") : null,
+      el("p", { class: "hint" }, `Model ${text(detail.model)}, prompt ${detail.prompt_version}, ${detail.mode === "model" ? "model review" : "pre-analysis only"}.`)),
+    el("h2", {}, "Candidates"),
+    detail.candidates.length ? detail.candidates.map((c) => candidateCard(c, detail.id)) : el("p", { class: "empty" }, "No candidates."),
+    el("h2", {}, `Pre-analysis facts (${facts.length})`),
+    el("p", { class: "hint" }, "Found by deterministic static checks before any model call. They are observations, not findings."),
+    tableOf(["Category", "Fact", "Line", "Excerpt"], facts.slice(0, 200).map((f) => el("tr", {},
+      el("td", {}, categoryLabel(f.category)), el("td", {}, f.detail), el("td", {}, text(f.line)),
+      el("td", { class: "mono" }, f.excerpt || ""))), "No facts."),
+    ((detail.preanalysis || {}).advisories || []).length ? el("div", {}, el("h2", {}, "Advisory matches (observed facts)"),
+      tableOf(["Library", "Version", "Advisory", "Applicability", "Reason"], detail.preanalysis.advisories.map((a) => el("tr", {},
+        el("td", {}, a.library), el("td", {}, text(a.version)), el("td", {}, a.advisory), el("td", {}, a.applicability),
+        el("td", {}, a.reason))), "")) : null);
+};
+
+async function memoryActions(example) {
+  const act = async (action, body) => {
+    try {
+      await api(projectPath(`/ai/memory/${encodeURIComponent(example.id)}/${action}`), { method: "POST", body: body || {} });
+      notice(`Example ${action === "approve" ? "approved" : action + "d"}. Reviews that used it are marked as possibly outdated.`, "ok");
+      show(example.status === "submitted" ? "aiPending" : "aiMemory");
+    } catch (error) { notice(error.message, "bad"); }
+  };
+  if (!can("manage_memory")) return null;
+  if (example.status === "submitted") {
+    return el("div", { class: "controls" },
+      el("button", { onclick: () => act("approve") }, "Approve"),
+      el("button", { onclick: () => confirm("Approve your own submission? It is recorded as self-approved.") && act("approve", { self_approve: true }) }, "Self-approve"),
+      el("button", { onclick: () => { const reason = prompt("Why is it rejected?"); if (reason) act("reject", { reason }); } }, "Reject"));
+  }
+  if (example.status === "approved") {
+    return el("div", { class: "controls" },
+      el("button", { onclick: () => act("disable", { reason: prompt("Reason (optional)") || "" }) }, "Disable"),
+      el("button", { onclick: () => { const explanation = prompt("Corrected explanation", (example.content || {}).explanation || "");
+        if (explanation) act("edit", { content: { explanation }, note: "edited in dashboard" }); } }, "Edit explanation"));
+  }
+  if (example.status === "disabled") {
+    return el("div", { class: "controls" }, el("button", { onclick: () => act("enable") }, "Re-enable"));
+  }
+  return null;
+}
+
+async function memoryView(root, status, view, title) {
+  const rows = await api(projectPath(`/ai/memory?status=${status}`));
+  const details = el("div", {});
+  root.replaceChildren(heading(title), aiTabs(view), el("p", { class: "hint" }, MEMORY_SENTENCE),
+    tableOf(["Example", "Status", "Revision", "Verdict", "Category", "Title"], rows.map((row) => el("tr", {},
+      el("td", {}, el("button", { onclick: () => memoryDetail(details, row.id) }, row.id.slice(0, 8))),
+      el("td", {}, row.status + (row.self_approved ? " (self-approved)" : "")), el("td", {}, `r${row.current_revision}`),
+      el("td", {}, (row.content || {}).verdict || ""), el("td", {}, categoryLabel((row.content || {}).category || "")),
+      el("td", {}, (row.content || {}).title || ""))), status === "submitted" ? "Nothing awaits approval." : "No approved examples."),
+    details);
+}
+
+async function memoryDetail(box, id) {
+  const example = await api(projectPath(`/ai/memory/${encodeURIComponent(id)}`));
+  const content = example.content || {};
+  const conditions = example.conditions || {};
+  box.replaceChildren(el("div", { class: "panel" },
+    el("h2", {}, content.title || "Example"),
+    fact("Verdict", content.verdict), fact("Category", categoryLabel(content.category || "")),
+    fact("Explanation", content.explanation), fact("Reason", content.reason),
+    el("h3", {}, "Code it applies to"), el("pre", {}, content.snippet || ""),
+    el("h3", {}, "Applicability conditions"),
+    fact("Path pattern", conditions.path_pattern), fact("Technologies", (conditions.technologies || []).map((t) => `${t.name} ${t.version_range}`).join(", ")),
+    fact("Identifiers", (conditions.identifiers || []).join(", ")), fact("Context", conditions.context),
+    fact("Review by", conditions.review_by), fact("Code fingerprint", conditions.fingerprint),
+    await memoryActions(example),
+    el("h3", {}, "History"),
+    el("ul", {}, example.events.map((e) => el("li", {}, `${when(e.at)} ${e.action.replace("_", " ")} r${text(e.revision)}${e.reason ? ": " + e.reason : ""}`))),
+    el("h3", {}, "Revisions"),
+    el("ul", {}, example.revisions.map((r) => el("li", {}, `r${r.revision} ${when(r.created_at)}${r.note ? ": " + r.note : ""}`)))));
+}
+
+views.aiPending = (root) => memoryView(root, "submitted", "aiPending", "Memory awaiting approval");
+views.aiMemory = (root) => memoryView(root, "approved", "aiMemory", "Approved examples");
+
+views.aiAdvanced = async (root) => {
+  const status = await api(projectPath("/ai/status"));
+  const result = el("div", {});
+  const check = el("button", { onclick: async () => {
+    try {
+      const report = await api(projectPath("/ai/check"), { method: "POST" });
+      result.replaceChildren(el("div", { class: `panel ${report.ready ? "" : "warn"}` },
+        el("h2", {}, report.outcome.replace(/_/g, " ").toUpperCase()), el("p", {}, report.message),
+        report.installed_models.length ? fact("Installed models", report.installed_models.join(", ")) : null,
+        report.guidance.map((line) => el("p", { class: "hint" }, line))));
+    } catch (error) { notice(error.message, "bad"); }
+  } }, "Check connection (sends no prompt)");
+  const switches = [["retain_response_bodies", "Keep page HTML and inline scripts for review"],
+    ["allow_source_maps", "Fetch in-scope source maps"], ["memory_require_second_reviewer", "Require a second reviewer for project memory"],
+    ["review_changed_scripts", "Continuous monitoring: AI review changed scripts"]];
+  root.replaceChildren(heading("Model status and Advanced"), aiTabs("aiAdvanced"),
+    el("div", { class: "panel" }, el("h2", {}, "Model status"), fact("Endpoint", status.endpoint), fact("Model", status.model),
+      fact("Context window", `${status.num_ctx} tokens`), check, result),
+    el("div", { class: "panel" }, el("h2", {}, "Project switches"),
+      el("p", { class: "hint" }, "Owner only. Changes are audited."),
+      switches.map(([key, label]) => el("div", {}, `${label}: `, badge(status.project[key] ? "ON" : "OFF", status.project[key] ? "warn" : "muted"), " ",
+        can("manage_project") ? el("button", { onclick: async () => {
+          if (!confirm(`Turn "${label}" ${status.project[key] ? "off" : "on"}?`)) return;
+          try {
+            await api(projectPath("/ai/settings"), { method: "PATCH", body: { [key]: !status.project[key] } });
+            show("aiAdvanced");
+          } catch (error) { notice(error.message, "bad"); }
+        } }, status.project[key] ? "Turn off" : "Turn on") : null))),
+    el("div", { class: "panel" }, el("h2", {}, "Technical settings"),
+      el("p", { class: "hint" }, "From the profile and .env (WATCHTOWER__AI__...)."),
+      tableOf(["Setting", "Value"], Object.entries(status.advanced).map(([key, value]) => el("tr", {},
+        el("td", { class: "mono" }, key), el("td", {}, String(value)))), "")));
+};
 
 // ---- start -------------------------------------------------------------
 

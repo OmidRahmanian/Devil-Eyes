@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from sqlalchemy import (
     BigInteger,
+    Boolean,
     CheckConstraint,
     Column,
     ForeignKey,
@@ -59,6 +60,16 @@ PROJECT_SCOPED_TABLES = (
     "notifications",
     "run_cancellations",
     "phase_snapshots",
+    "ai_project_settings",
+    "ai_sources",
+    "ai_analyses",
+    "ai_candidates",
+    "ai_chunk_cache",
+    "ai_feedback",
+    "ai_memory_examples",
+    "ai_memory_revisions",
+    "ai_memory_events",
+    "ai_memory_usage",
 )
 
 
@@ -425,4 +436,217 @@ phase_snapshots = Table(
         name="json_shapes",
     ),
     Index(None, "project_id", "target", "phase", "created_at"),
+)
+
+
+# -- AI security review (migration 0004) ------------------------------------
+
+
+def _flag(name: str) -> Column:
+    return Column(name, Boolean, nullable=False, server_default=text("false"))
+
+
+def _principal(name: str) -> Column:
+    return Column(name, UUID(as_uuid=True), ForeignKey("principals.id"), nullable=True)
+
+
+def _json(name: str, default: str = "'{}'::jsonb") -> Column:
+    return Column(name, JSONB, nullable=False, server_default=text(default))
+
+
+ai_project_settings = Table(
+    "ai_project_settings", metadata,
+    Column("project_id", UUID(as_uuid=True), ForeignKey("projects.id"), nullable=False),
+    _flag("retain_response_bodies"),
+    _flag("allow_source_maps"),
+    _flag("memory_require_second_reviewer"),
+    _flag("review_changed_scripts"),
+    _ts("updated_at", now=True),
+    _principal("updated_by"),
+    PrimaryKeyConstraint("project_id"),
+)
+
+ai_sources = Table(
+    "ai_sources", metadata,
+    _id(),
+    _project(),
+    Column("run_id", UUID(as_uuid=True), nullable=True),
+    Column("origin", Text, nullable=False),
+    Column("kind", Text, nullable=False),
+    Column("url", Text, nullable=False),
+    Column("final_url", Text, nullable=True),
+    Column("status_code", Integer, nullable=True),
+    Column("content_type", Text, nullable=False, server_default=""),
+    Column("size_bytes", BigInteger, nullable=False, server_default="0"),
+    Column("sha256", Text, nullable=True),  # of the original content, which is never stored
+    Column("redacted_sha256", Text, nullable=True),
+    Column("storage_uri", Text, nullable=True),  # redacted content; None for references and header-only pages
+    _flag("truncated"),
+    Column("redactions", Integer, nullable=False, server_default="0"),
+    _json("details"),
+    _json("preanalysis"),
+    _ts("created_at", now=True),
+    _ts("expires_at", nullable=True),
+    PrimaryKeyConstraint("id"),
+    UniqueConstraint("project_id", "id"),
+    CheckConstraint("origin IN ('scan_evidence', 'retained_body', 'collected', 'reference', 'source_map')", name="origin"),
+    CheckConstraint("kind IN ('scan_summary', 'html', 'script', 'inline_script', 'source_map_source', 'reference')",
+                    name="kind"),
+    CheckConstraint("sha256 IS NULL OR sha256 ~ '^[0-9a-f]{64}$'", name="sha256_hex"),
+    Index(None, "project_id", "run_id"),
+)
+
+ai_analyses = Table(
+    "ai_analyses", metadata,
+    _id(),
+    _project(),
+    Column("run_id", UUID(as_uuid=True), nullable=True),
+    _principal("requested_by"),
+    Column("status", Text, nullable=False, server_default="queued"),
+    Column("mode", Text, nullable=False, server_default="model"),
+    _json("source_ids", "'[]'::jsonb"),
+    Column("model", Text, nullable=False, server_default=""),
+    Column("prompt_version", Text, nullable=False, server_default=""),
+    Column("config_hash", Text, nullable=False, server_default=""),
+    Column("reanalysis_of", UUID(as_uuid=True), nullable=True),
+    _json("preanalysis"),
+    _json("coverage"),
+    Column("error", Text, nullable=True),
+    _ts("outdated_at", nullable=True),
+    Column("outdated_reason", Text, nullable=True),
+    _ts("created_at", now=True),
+    _ts("started_at", nullable=True),
+    _ts("finished_at", nullable=True),
+    PrimaryKeyConstraint("id"),
+    UniqueConstraint("project_id", "id"),
+    CheckConstraint("status IN ('queued', 'running', 'completed', 'partial', 'failed', 'cancelled')", name="status"),
+    CheckConstraint("mode IN ('model', 'preanalysis_only')", name="mode"),
+    Index(None, "project_id", "created_at"),
+)
+
+ai_candidates = Table(
+    "ai_candidates", metadata,
+    _id(),
+    _project(),
+    Column("analysis_id", UUID(as_uuid=True), nullable=False),
+    Column("ordinal", Integer, nullable=False),
+    Column("category", Text, nullable=False),
+    Column("title", Text, nullable=False),
+    Column("supported", Boolean, nullable=False),
+    Column("citation_status", Text, nullable=False),
+    Column("confidence", Text, nullable=False),
+    _json("data"),
+    Column("matched_finding_id", UUID(as_uuid=True), nullable=True),
+    _ts("created_at", now=True),
+    PrimaryKeyConstraint("id"),
+    UniqueConstraint("project_id", "id"),
+    UniqueConstraint("analysis_id", "ordinal"),
+    ForeignKeyConstraint(["project_id", "analysis_id"], ["ai_analyses.project_id", "ai_analyses.id"]),
+    ForeignKeyConstraint(["project_id", "matched_finding_id"], ["findings.project_id", "findings.id"]),
+    CheckConstraint("citation_status IN ('verified', 'partial', 'not_verified')", name="citation_status"),
+    CheckConstraint("confidence IN ('low', 'medium', 'high')", name="confidence"),
+)
+
+ai_chunk_cache = Table(
+    "ai_chunk_cache", metadata,
+    _project(),
+    Column("cache_key", Text, nullable=False),
+    Column("model", Text, nullable=False),
+    Column("prompt_version", Text, nullable=False),
+    _json("result"),
+    _ts("created_at", now=True),
+    PrimaryKeyConstraint("project_id", "cache_key"),
+)
+
+ai_feedback = Table(
+    "ai_feedback", metadata,
+    _id(),
+    _project(),
+    Column("analysis_id", UUID(as_uuid=True), nullable=False),
+    Column("candidate_id", UUID(as_uuid=True), nullable=False),
+    Column("kind", Text, nullable=False),
+    Column("reason", Text, nullable=False, server_default=""),
+    _json("corrected"),
+    _json("evidence", "'[]'::jsonb"),
+    _flag("submitted_for_memory"),
+    _principal("author"),
+    _ts("created_at", now=True),
+    PrimaryKeyConstraint("id"),
+    UniqueConstraint("project_id", "id"),
+    ForeignKeyConstraint(["project_id", "analysis_id"], ["ai_analyses.project_id", "ai_analyses.id"]),
+    ForeignKeyConstraint(["project_id", "candidate_id"], ["ai_candidates.project_id", "ai_candidates.id"]),
+    CheckConstraint("kind IN ('looks_correct', 'false_positive', 'edit')", name="kind"),
+    CheckConstraint("kind <> 'false_positive' OR length(trim(reason)) > 0", name="reason_present"),
+    Index(None, "project_id", "candidate_id"),
+)
+
+ai_memory_examples = Table(
+    "ai_memory_examples", metadata,
+    _id(),
+    _project(),
+    Column("status", Text, nullable=False, server_default="submitted"),
+    _flag("eligible"),
+    Column("current_revision", Integer, nullable=False, server_default="1"),
+    Column("approved_revision", Integer, nullable=True),
+    Column("feedback_id", UUID(as_uuid=True), nullable=True),
+    _principal("submitted_by"),
+    _principal("reviewed_by"),
+    _ts("reviewed_at", nullable=True),
+    _flag("self_approved"),
+    Column("superseded_by", UUID(as_uuid=True), nullable=True),
+    _ts("created_at", now=True),
+    _ts("updated_at", now=True),
+    PrimaryKeyConstraint("id"),
+    UniqueConstraint("project_id", "id"),
+    ForeignKeyConstraint(["project_id", "feedback_id"], ["ai_feedback.project_id", "ai_feedback.id"]),
+    CheckConstraint("status IN ('submitted', 'approved', 'rejected', 'superseded', 'disabled')", name="status"),
+    CheckConstraint("NOT eligible OR (status = 'approved' AND approved_revision IS NOT NULL)",
+                    name="eligible_when_approved"),
+)
+
+ai_memory_revisions = Table(
+    "ai_memory_revisions", metadata,
+    _project(),
+    Column("example_id", UUID(as_uuid=True), nullable=False),
+    Column("revision", Integer, nullable=False),
+    _json("content"),
+    _json("conditions"),
+    _principal("author"),
+    Column("note", Text, nullable=False, server_default=""),
+    _ts("created_at", now=True),
+    PrimaryKeyConstraint("example_id", "revision"),
+    ForeignKeyConstraint(["project_id", "example_id"], ["ai_memory_examples.project_id", "ai_memory_examples.id"]),
+    CheckConstraint("revision > 0", name="revision_positive"),
+)
+
+ai_memory_events = Table(
+    "ai_memory_events", metadata,
+    Column("id", BigInteger, primary_key=True, autoincrement=True),
+    _project(),
+    Column("example_id", UUID(as_uuid=True), nullable=False),
+    Column("action", Text, nullable=False),
+    Column("revision", Integer, nullable=True),
+    _principal("actor"),
+    Column("reason", Text, nullable=False, server_default=""),
+    _ts("created_at", now=True),
+    ForeignKeyConstraint(["project_id", "example_id"], ["ai_memory_examples.project_id", "ai_memory_examples.id"]),
+    CheckConstraint("action IN ('submitted', 'approved', 'self_approved', 'rejected', 'edited', 'disabled', "
+                    "'re_enabled', 'superseded')", name="action"),
+    Index(None, "project_id", "example_id"),
+)
+
+# Which approved example revisions an analysis received. Kept forever, also for later-disabled examples.
+ai_memory_usage = Table(
+    "ai_memory_usage", metadata,
+    _project(),
+    Column("analysis_id", UUID(as_uuid=True), nullable=False),
+    Column("example_id", UUID(as_uuid=True), nullable=False),
+    Column("revision", Integer, nullable=False),
+    _json("score"),
+    Column("reason", Text, nullable=False, server_default=""),
+    _ts("created_at", now=True),
+    PrimaryKeyConstraint("analysis_id", "example_id", "revision"),
+    ForeignKeyConstraint(["project_id", "analysis_id"], ["ai_analyses.project_id", "ai_analyses.id"]),
+    ForeignKeyConstraint(["project_id", "example_id"], ["ai_memory_examples.project_id", "ai_memory_examples.id"]),
+    Index(None, "project_id", "example_id"),
 )

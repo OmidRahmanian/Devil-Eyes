@@ -136,8 +136,14 @@ class HttpProber:
         max_redirects: int = 0,
         retry_unverified_tls: bool = True,
         clock: Callable[[], datetime] = utcnow,
+        keep_body: bool = False,
+        extra_headers: Iterable[str] = (),
     ) -> None:
+        """``keep_body`` adds the (size-capped) body bytes as ``body`` and ``extra_headers`` keeps more
+        response headers; both are for AI collection only, so scan observations never carry bodies."""
         self.guard = guard
+        self.keep_body = keep_body
+        self.extra_headers = frozenset(name.lower() for name in extra_headers)
         self._resolve = resolve
         self.timeout = timeout
         self.max_body_bytes = max_body_bytes
@@ -180,6 +186,7 @@ class HttpProber:
                 outcome = "blocked_destination" if exc.kind == "blocked_destination" else "error"
                 observation.update(_no_response(), url=url, scheme=scheme, port=port, outcome=outcome,
                                    error={"kind": exc.kind, "message": str(exc)})
+                observation.pop("body", None)
                 return observation
             observation.update(url=url, scheme=scheme, port=port, outcome="ok", **response)
 
@@ -272,8 +279,11 @@ class HttpProber:
                 body.extend(chunk)
             truncated = len(body) > self.max_body_bytes
             body = bytes(body[: self.max_body_bytes])
-            headers = {key.lower(): value[:1024] for key, value in response.getheaders() if key.lower() in KEPT_HEADERS}
+            headers = {key.lower(): value[:1024] for key, value in response.getheaders()
+                       if key.lower() in KEPT_HEADERS or key.lower() in self.extra_headers}
+            kept = {"body": body} if self.keep_body else {}
             return {
+                **kept,
                 "ip": ip,
                 "status_code": response.status,
                 "response_time_ms": round((time.monotonic() - started) * 1000, 3),

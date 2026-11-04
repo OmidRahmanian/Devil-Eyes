@@ -46,3 +46,11 @@ class RunCancelled(WatchtowerError):
 
 class RequestConflict(WatchtowerError):
     """An idempotency key was reused with different scan parameters."""
+
+
+class AiDisabled(WatchtowerError):
+    """The optional AI review is turned off (``ai.enabled``)."""
+
+
+class AiInvalidAction(WatchtowerError, ValueError):
+    """An AI review or memory action is not allowed in the record's current state."""

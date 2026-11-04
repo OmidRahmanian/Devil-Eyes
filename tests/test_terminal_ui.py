@@ -724,8 +724,15 @@ class FakeCli:
         self.runs = []
         self.keys = {}
         self.cancelled = []
+        self.ai = {"enabled": False, "project": {"review_changed_scripts": False}}
+        self.ai_collects = []
 
     def __call__(self, client, *args):
+        if args == ("ai", "status"):
+            return self.ai
+        if args[:2] == ("ai", "collect"):
+            self.ai_collects.append(args)
+            return {"run": {"run_id": str(uuid4()), "kind": "ai.collect"}, "analysis_id": str(uuid4())}
         if args == ("status",):
             return {"scope": {"rules": [{"effect": "include", "pattern": root} for root in self.roots]}}
         if args[:2] == ("run", "list"):
@@ -1071,3 +1078,171 @@ def test_monitoring_window_command_carries_paths_only(client):
     argv = ui.window_arguments(client, monitor=True)
     assert argv[-1] == "--monitor" and "--run" not in argv
     assert str(client.token_file) in argv and "WATCHTOWER_TOKEN" not in " ".join(argv)
+
+
+def test_monitoring_ai_review_is_opt_in(client, cli):
+    store = ui.MonitorStore(client.root, client.profile)
+    saved = plan(client)
+    clock = {"now": START}
+    monitor = monitor_at(client, store, clock)
+    progress = store.progress(saved)
+    monitor.tick(saved, progress)
+    cli.finish()
+    monitor.tick(saved, progress)
+    assert cli.ai_collects == [] and not monitor.ai_requested  # AI review is off by default
+
+
+def test_monitoring_reviews_changed_scripts_once_per_scan_when_enabled(client, cli):
+    cli.ai = {"enabled": True, "project": {"review_changed_scripts": True}}
+    store = ui.MonitorStore(client.root, client.profile)
+    saved = plan(client)
+    clock = {"now": START}
+    monitor = monitor_at(client, store, clock)
+    progress = store.progress(saved)
+    monitor.tick(saved, progress)
+    monitor.tick(saved, progress)
+    assert cli.ai_collects == []  # nothing until the monitored scan finishes
+    cli.finish()
+    monitor.tick(saved, progress)
+    monitor.tick(saved, progress)
+    assert len(cli.ai_collects) == 1 and monitor.ai_requested
+    scan = cli.runs[0]["run_id"]
+    assert cli.ai_collects[0] == ("ai", "collect", "--review", "--idempotency-key", "monitor-ai-" + scan,
+                                  "--target", "acme.example")
+
+
+def test_ai_runs_never_count_as_unfinished_scans(client, cli):
+    cli.runs.append({"run_id": str(uuid4()), "kind": "ai.collect", "status": "running", "targets": ["acme.example"],
+                     "created_at": START.isoformat(), "finished_at": None})
+    assert ui.active_scan(client) == []
+    assert ui.monitored_scans(cli.runs, {"targets": []}) == []
+
+
+# -- AI security review -----------------------------------------------------------
+
+AI_STATUS = {"enabled": True, "model": "qwen3:8b-q4_K_M", "endpoint": "http://127.0.0.1:11434",
+             "project": {"retain_response_bodies": False, "allow_source_maps": False,
+                         "memory_require_second_reviewer": False, "review_changed_scripts": False},
+             "memory": {"approved": 1, "awaiting_approval": 2}, "latest_analysis": None, "advanced": {"num_ctx": 8192}}
+PREVIEW = {"visible": "This review is based on 1 in-scope script. Server-side code is not visible to scans.",
+           "files": [{"kind": "script", "url": "https://acme.example/app.js", "origin": "in-scope script",
+                      "size_bytes": 900, "redactions": 1, "sent": True}],
+           "chunks": 1, "token_estimate": 300, "redactions": 1, "skipped": [], "model": "qwen3:8b-q4_K_M", "num_ctx": 8192}
+
+
+class FakeAiCli:
+    def __init__(self, status=None):
+        self.status = dict(AI_STATUS, **(status or {}))
+        self.calls = []
+        self.shown = []
+
+    def json(self, client, *args):
+        self.calls.append(args)
+        if args == ("ai", "status"):
+            return self.status
+        if args[:2] == ("ai", "preview"):
+            return PREVIEW
+        if args[:2] in (("ai", "review"), ("ai", "collect")):
+            return {"run": {"run_id": "11111111-1111-1111-1111-111111111111"}, "analysis_id": "a" * 8}
+        if args[:2] == ("ai", "results"):
+            return [{"id": "b" * 36, "status": "completed", "mode": "model", "outdated": False,
+                     "candidates": {"supported": 1, "unsupported": 0}}]
+        if args[:2] == ("ai", "show"):
+            return {"candidates": [{"id": "c" * 36, "title": "innerHTML sink", "confidence": "medium", "supported": True}]}
+        if args == ("status",):
+            return {"scope": {"rules": [{"effect": "include", "pattern": "acme.example"}]}}
+        raise AssertionError(args)
+
+
+@pytest.fixture
+def ai_cli(monkeypatch):
+    fake = FakeAiCli()
+    monkeypatch.setattr(ui.Client, "json", lambda self, *args: fake.json(self, *args))
+    monkeypatch.setattr(ui.Client, "show", lambda self, *args: fake.shown.append(args))
+    launched = []
+    monkeypatch.setattr(ui, "launch_scan", lambda client, run_id: launched.append(run_id))
+    fake.launched = launched
+    return fake
+
+
+def test_home_has_an_ai_entry_without_renumbering():
+    assert list(ui.HOME)[:9] == [str(i) for i in range(1, 10)] and ui.HOME["a"] == "AI security review"
+    assert list(ui.HOME)[-1] == "0"
+
+
+def test_ai_review_previews_then_sends_only_after_confirmation(client, ai_cli, monkeypatch):
+    answers = iter(["n"])
+    monkeypatch.setattr(ui, "yes_no", lambda *a, **kw: next(answers) == "y")
+    ui.ai_review(client)
+    assert ("ai", "preview") in ai_cli.calls and not any(c[:2] == ("ai", "review") for c in ai_cli.calls)
+    answers = iter(["y"])
+    ui.ai_review(client)
+    review = next(c for c in ai_cli.calls if c[:2] == ("ai", "review"))
+    assert "--no-model" not in review and ai_cli.launched == ["11111111-1111-1111-1111-111111111111"]
+
+
+def test_ai_review_offers_pre_analysis_only_while_disabled(client, ai_cli, monkeypatch):
+    ai_cli.status["enabled"] = False
+    monkeypatch.setattr(ui, "yes_no", lambda *a, **kw: True)
+    ui.ai_review(client, finding="f" * 36)
+    review = next(c for c in ai_cli.calls if c[:2] == ("ai", "review"))
+    assert "--no-model" in review and "--finding" in review
+
+
+def test_ai_feedback_false_positive_with_memory_submission(client, ai_cli, monkeypatch):
+    answers = iter(["1", "1", "2", "sanitized by the template", "y", "only on /shop"])
+    monkeypatch.setattr("builtins.input", lambda prompt: next(answers))
+    monkeypatch.setattr(ui.launcher, "yes_no", lambda *a, **kw: next(answers) == "y")
+    ui.ai_feedback(client)
+    args = ai_cli.shown[-1]
+    assert args[:5] == ("ai", "feedback", "c" * 36, "--kind", "false_positive")
+    assert "--memory" in args and "sanitized by the template" in args and "only on /shop" in args
+
+
+def test_live_ai_menu_replaces_content_under_the_header(client, ai_cli, monkeypatch, live):
+    answers = iter(["7", "0"])
+    ai_cli.status["enabled"] = False
+    original = ai_cli.json
+
+    def json_with_check(c, *args):
+        if args == ("ai", "check"):
+            return {"outcome": "disabled", "message": "AI review is disabled.", "endpoint": "http://127.0.0.1:11434",
+                    "endpoint_kind": "", "installed_models": [], "guidance": ["Scans work the same either way."]}
+        return original(c, *args)
+    monkeypatch.setattr(ui.Client, "json", lambda self, *args: json_with_check(self, *args))
+    monkeypatch.setattr("builtins.input", lambda prompt: next(answers))
+    ui.SCREEN.show_status(["DEVILS EYES | Platform", "Project: acme | Profile: development"])
+    ui.ai_menu(client)
+    menus = [frame for frame in live() if "8) Advanced" in frame]
+    assert menus and all(frame.count("DEVILS EYES | Platform") == 1 for frame in menus)
+    assert any("AI review: DISABLED" in frame for frame in menus)
+    assert any("Scans work the same either way." in frame for frame in live())
+
+
+def test_plain_terminal_ai_menu_prints_sequentially(client, ai_cli, monkeypatch):
+    output = io.StringIO()
+    monkeypatch.setattr(ui.sys, "stdout", output)
+    monkeypatch.setattr(ui, "SCREEN", ui.Screen())
+    ui.SCREEN.start(no_clear=True)
+    monkeypatch.setattr("builtins.input", lambda prompt: "0")
+    ui.ai_menu(client)
+    text = output.getvalue()
+    assert "\033[H" not in text and "AI review: ENABLED" in text and "1) Review latest scan" in text
+
+
+def test_ai_run_progress_shows_collection_and_analysis(client, monkeypatch):
+    output = io.StringIO()
+    monkeypatch.setattr(ui.sys, "stdout", output)
+    monkeypatch.setattr(ui, "SCREEN", ui.Screen())
+    ui.SCREEN.start(no_clear=True)
+    detail = {"run": {"run_id": str(uuid4()), "status": "succeeded", "kind": "ai.collect",
+                      "created_at": "2026-10-30T10:00:00+00:00", "finished_at": "2026-10-30T10:01:00+00:00"},
+              "jobs": [{"kind": "ai.collect", "status": "succeeded",
+                        "result": {"pages": 1, "scripts": 2, "inline_scripts": 0, "references": 1,
+                                   "notes": ["Source maps were referenced but not fetched"], "skipped": []}},
+                       {"kind": "ai.analyze", "status": "succeeded", "result": {"analysis_id": "d" * 36,
+                                                                                 "status": "completed"}}]}
+    ui.render_progress(detail, "acme")
+    text = output.getvalue()
+    assert "Collect for AI review > Analyze" in text and "2 script(s)" in text and "Discovery > DNS" not in text
+    assert "1 third-party reference(s) not fetched" in text and "View results" in text

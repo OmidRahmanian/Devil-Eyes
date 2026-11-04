@@ -1,0 +1,9 @@
+{
+  "vuln_dom_xss.js": [{"category": "dom_xss_sink", "line": 4}],
+  "vuln_open_redirect.js": [{"category": "open_redirect", "line": 5}],
+  "vuln_token_storage.js": [{"category": "insecure_token_storage", "line": 5}],
+  "vuln_postmessage.js": [{"category": "dom_xss_sink", "line": 5}],
+  "safe_textcontent.js": [],
+  "safe_sanitized.js": [],
+  "safe_origin_checked.js": []
+}
