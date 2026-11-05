@@ -5,7 +5,9 @@ from __future__ import annotations
 from uuid import uuid4
 
 import pytest
+from sqlalchemy import select
 
+from watchtower.persistence.tables import audit_events
 from watchtower.security.auth import ProjectRole
 
 pytestmark = pytest.mark.postgres
@@ -90,6 +92,26 @@ def test_scope_publication_needs_manage_scope_and_an_attestation(client, project
     scope = client.get(f"/api/v1/projects/{project_id}/scope", headers=viewer.headers).json()
     assert scope["current"]["id"] == revision["id"]
     assert [r["number"] for r in scope["history"]] == [1]
+
+
+def test_archiving_needs_manage_project_and_the_typed_slug(client, database, project_id, owner, operator):
+    path = f"/api/v1/projects/{project_id}/archive"
+    with database.system() as system:
+        slug = system.projects.get(project_id).slug
+    assert client.post(path, json={"confirm": slug}, headers=operator.headers).status_code == 403
+    wrong = client.post(path, json={"confirm": slug + "-x"}, headers=owner.headers)
+    assert wrong.status_code == 409 and wrong.json()["error"] == "request_conflict"
+    assert client.get(f"/api/v1/projects/{project_id}", headers=owner.headers).json()["archived"] is False
+
+    archived = client.post(path, json={"confirm": slug}, headers=owner.headers)
+    assert archived.status_code == 200 and archived.json()["archived"] is True
+    # Nothing new can be authorized for an archived project, and archiving again is harmless.
+    assert publish(client, project_id, owner).json()["error"] == "invalid_scope"
+    assert client.post(path, json={"confirm": slug}, headers=owner.headers).status_code == 200
+    with database.project(project_id) as uow:
+        actors = list(uow.connection.execute(select(audit_events.c.actor_principal_id).where(
+            audit_events.c.project_id == project_id, audit_events.c.action == "project.archived")).scalars())
+    assert actors and set(actors) == {owner.principal_id}
 
 
 def test_scope_check_and_revocation(client, project_id, owner, viewer):

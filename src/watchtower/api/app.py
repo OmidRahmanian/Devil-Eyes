@@ -15,6 +15,8 @@ from __future__ import annotations
 
 import json
 import logging
+import re
+import secrets
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -30,6 +32,7 @@ from fastapi.staticfiles import StaticFiles
 import watchtower
 from watchtower.adapters.checks import RuleIntegrityError, RuleSet, load_manifest
 from watchtower.api import queries, schemas
+from watchtower.api.local import LocalOwner, same_machine
 from watchtower.api.pagination import (
     DEFAULT_LIMIT,
     MAX_LIMIT,
@@ -59,7 +62,7 @@ from watchtower.domain.models import AssetKind, FindingStatus, Severity
 from watchtower.domain.repositories import BlobStore
 from watchtower.domain.scope import AuthorizationReference, RuleEffect, ScopeRule, ScopeExecution
 from watchtower.persistence.database import Database
-from watchtower.security.auth import Permission, ProjectContext
+from watchtower.security.auth import Permission, ProjectContext, ProjectRole
 from watchtower.services.evidence_store import BlobError, FilesystemBlobStore
 from watchtower.services.findings import FindingError, FindingService, RepositoryFindingStore
 from watchtower.services.scope import ScopeService
@@ -88,6 +91,7 @@ class ApiServices:
     runs: RunsPort | None = None
     rules: Callable[[], RuleSet] = load_manifest
     settings: Settings = field(default_factory=Settings)
+    local: LocalOwner | None = None  # set when the open local dashboard is on
 
 
 # -- authentication -------------------------------------------------------
@@ -99,16 +103,25 @@ def services(request: Request) -> ApiServices:
     return request.app.state.services
 
 
+def request_token(request: Request, credentials: HTTPAuthorizationCredentials | None) -> str:
+    """The bearer token, or the local owner's token for the open local dashboard on this computer."""
+    if credentials is not None and credentials.scheme.lower() == "bearer":
+        return credentials.credentials
+    local = services(request).local
+    if local is not None and same_machine(request):
+        return local.token()
+    raise AuthenticationFailed("missing bearer token")
+
+
 def project_context(
     project_id: UUID,
     request: Request,
     credentials: Annotated[HTTPAuthorizationCredentials | None, Depends(_bearer)],
 ) -> ProjectContext:
-    if credentials is None or credentials.scheme.lower() != "bearer":
-        raise AuthenticationFailed("missing bearer token")
+    token = request_token(request, credentials)
     with services(request).database.system() as system:
         try:
-            return system.auth.project_context(credentials.credentials, project_id)
+            return system.auth.project_context(token, project_id)
         except PermissionDenied:
             # Not a member, or a token restricted to another project.
             raise NotFound("project not found") from None
@@ -198,13 +211,15 @@ def health() -> dict[str, str]:
 
 @router.get("/projects", response_model=list[schemas.ProjectOut])
 def list_projects(
-    svc: Services, credentials: Annotated[HTTPAuthorizationCredentials | None, Depends(_bearer)]
+    request: Request, svc: Services, credentials: Annotated[HTTPAuthorizationCredentials | None, Depends(_bearer)]
 ) -> list[schemas.ProjectOut]:
     """Projects the token's principal belongs to."""
-    if credentials is None or credentials.scheme.lower() != "bearer":
-        raise AuthenticationFailed("missing bearer token")
+    token = request_token(request, credentials)
+    if svc.local is not None and credentials is None:
+        # The local owner owns every project, including ones the terminal created since.
+        svc.local.adopt_projects()
     with svc.database.system() as system:
-        principal, restricted_to = system.auth.authenticate(credentials.credentials)
+        principal, restricted_to = system.auth.authenticate(token)
         result = []
         for project_id, role in system.auth.memberships(principal.id):
             if restricted_to is not None and project_id != restricted_to:
@@ -249,6 +264,43 @@ def _rules(svc: ApiServices) -> list[schemas.RuleOut]:
         return []
     return [schemas.RuleOut(id=rule.id, version=rule.version, kind=rule.kind, title=rule.title,
                             severity=rule.severity.value, approved=rule.approved) for rule in ruleset]
+
+
+@router.post("/projects", response_model=schemas.ProjectOut, status_code=201)
+def create_project(
+    body: schemas.CreateProjectIn, request: Request, svc: Services,
+    credentials: Annotated[HTTPAuthorizationCredentials | None, Depends(_bearer)],
+) -> schemas.ProjectOut:
+    """Create a project owned by the local owner. Only the open local dashboard can; otherwise use `watchtower bootstrap`."""
+    if svc.local is None or credentials is not None or not same_machine(request):
+        raise PermissionDenied("create projects from the local dashboard or with `watchtower bootstrap`")
+    principal = svc.local.principal()
+    base = re.sub(r"[^a-z0-9]+", "-", body.name.lower()).strip("-")[:50] or "project"
+    with svc.database.system() as system:
+        slug = base
+        while system.projects.get_by_slug(slug) is not None:
+            slug = f"{base}-{secrets.token_hex(3)}"
+        project = system.projects.create(slug, body.name.strip())
+        system.auth.set_membership(project.id, principal.id, ProjectRole.OWNER, actor=principal.id)
+    return schemas.project_out(project, ProjectContext(project_id=project.id, principal=principal, role=ProjectRole.OWNER))
+
+
+@project_router.post("/archive", response_model=schemas.ProjectOut)
+def archive_project(project_id: UUID, body: schemas.ArchiveProjectIn, ctx: Context, svc: Services) -> schemas.ProjectOut:
+    """Archive the project: scope denies every target from now on and it leaves project lists.
+
+    Nothing is deleted. Scope history, observations and the audit log are
+    append-only, so the records stay in the database, out of view.
+    """
+    ctx.require(Permission.MANAGE_PROJECT)
+    with svc.database.system() as system:
+        project = system.projects.get(project_id)
+        if project is None:
+            raise NotFound("project not found")
+        if body.confirm != project.slug:
+            raise RequestConflict("type the project's slug exactly to confirm archiving it")
+        archived = system.projects.archive(project_id, actor=ctx.principal.id)
+    return schemas.project_out(archived, ctx)
 
 
 # -- scope ----------------------------------------------------------------
@@ -597,6 +649,7 @@ def create_app(
         runs=default_runs(database, scope) if runs is _DEFAULT_RUNS else runs,  # type: ignore[arg-type]
         rules=rules,
         settings=settings,
+        local=LocalOwner(database, settings.auth.local_owner_token_file) if settings.auth.local_dashboard else None,
     )
     _install_error_handlers(app)
     _install_security_headers(app)

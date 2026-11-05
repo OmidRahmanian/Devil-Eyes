@@ -38,6 +38,7 @@ from watchtower.cli import safe, Style, RUN_COLOURS
 
 ROOT = Path(__file__).resolve().parent
 FINISHED = {"succeeded", "partial", "failed", "cancelled"}
+DASHBOARD_OWNER_TOKEN = ".config/watchtower/dashboard-owner-token"  # under HOME; see watchtower.api.local
 PROFILES = ("development", "lab", "production")
 PHASES = ("discovery", "dns", "http", "checks", "finalize")
 HOME = {
@@ -915,6 +916,14 @@ def open_dashboard_browser(client):
         webbrowser.open("http://127.0.0.1:8080")
 
 
+def ai_enabled(client):
+    from watchtower.config import load_settings
+    try:
+        return load_settings(client.profile).ai.enabled
+    except Exception:  # an AI misconfiguration must not stop the dashboard
+        return False
+
+
 def serve_dashboard(client, *, browse=False):
     """Start the server, wait for readiness, and reap it when this window closes."""
     if dashboard_state() == "ready":
@@ -925,19 +934,43 @@ def serve_dashboard(client, *, browse=False):
     if dashboard_state() == "other":
         raise UiError("Port 8080 is occupied by another service. Stop that service or use another dashboard port.")
     server = subprocess.Popen(client.command("serve"), cwd=client.root, env=client.env)
+    processor = ai_processor = None
     try:
         for _ in range(60):
             if server.poll() is not None:
                 raise UiError("Dashboard exited before it was ready. Check the server message above.")
             if dashboard_state() == "ready":
                 tell("Dashboard ready: http://localhost:8080. Keep this window open; Ctrl+C stops the server.")
-                tell("Login token file: " + str(client.token_file))
                 if browse:
                     open_dashboard_browser(client)
+                # Scans queued from the dashboard run here, so no separate processing window is needed.
+                # Started after the readiness checks: the worker's egress guard refuses loopback.
+                processor = LocalProcessor(client)
+                processor.start()
+                tell("Scan worker running: scans you start in the dashboard run in this window.")
+                if ai_enabled(client):
+                    ai_processor = AiProcessor(client)
+                    ai_processor.start()
+                    tell("AI worker running: AI reviews you request in the dashboard run in this window.")
+                reported = ai_reported = False
+                while server.poll() is None:
+                    if processor.error and not reported:
+                        tell("Scan worker stopped (" + processor.error + "). The dashboard keeps running; "
+                             "restart this window to resume queued scans.")
+                        reported = True
+                    if ai_processor and ai_processor.error and not ai_reported:
+                        tell("AI worker stopped (" + ai_processor.error + "). Scans continue; check "
+                             "Home > AI security review > Model status, then restart this window.")
+                        ai_reported = True
+                    time.sleep(1)
                 return server.wait()
             time.sleep(0.25)
         raise UiError("Dashboard startup timed out. Check database connectivity and port 8080.")
     finally:
+        if ai_processor:
+            ai_processor.close()
+        if processor:
+            processor.close()
         if server.poll() is None:
             server.terminate()
             try:
@@ -953,11 +986,17 @@ def accessible_projects(client, preferences):
     paths = [client.token_file]
     paths += [Path(p) for key, p in preferences.data["tokens"].items()
               if isinstance(key, str) and key.startswith(client.profile + ":") and isinstance(p, str)]
+    # The open local dashboard's owner holds every project, including ones created in the dashboard.
+    # It is asked last and only fills in projects no saved token of their own opens.
+    home = client.env.get("HOME")
+    local_owner = Path(home) / DASHBOARD_OWNER_TOKEN if home else None
+    if local_owner is not None and local_owner.is_file():
+        paths.append(local_owner)
     for path in dict.fromkeys(paths):
         candidate = Client(client.root, profile=client.profile, token_file=path, env=client.env)
         try:
             for project in candidate.json("projects"):
-                if not project["archived"]:
+                if not project["archived"] and (path != local_owner or project["slug"] not in candidates):
                     candidates[project["slug"]] = (project, path)
         except UiError:
             continue

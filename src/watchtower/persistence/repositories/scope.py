@@ -63,7 +63,7 @@ class PgProjectRepository:
             query = query.where(projects.c.archived_at.is_(None))
         return [_project(row) for row in self._conn.execute(query)]
 
-    def archive(self, project_id: UUID) -> Project:
+    def archive(self, project_id: UUID, *, actor: UUID | None = None) -> Project:
         row = self._conn.execute(
             projects.update()
             .where(projects.c.id == project_id)
@@ -72,7 +72,7 @@ class PgProjectRepository:
         ).one_or_none()
         if row is None:
             raise NotFound(f"project {project_id} not found")
-        record_audit(self._conn, "project.archived", f"project:{project_id}", project_id=project_id)
+        record_audit(self._conn, "project.archived", f"project:{project_id}", project_id=project_id, actor=actor)
         return _project(row)
 
 

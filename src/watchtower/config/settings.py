@@ -87,6 +87,10 @@ class ScopeSettings(_Section):
 
 class AuthSettings(_Section):
     token_ttl_days: int | None = Field(default=90, ge=1)
+    # Open the dashboard without a token for browsers on this computer (see watchtower.api.local).
+    # `watchtower serve --allow-remote` always turns it off.
+    local_dashboard: bool = False
+    local_owner_token_file: str = "~/.config/watchtower/dashboard-owner-token"
 
 
 _KEY = r"^[a-z0-9][a-z0-9_.:-]{0,63}$"

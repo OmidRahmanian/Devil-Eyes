@@ -13,13 +13,13 @@ The legacy MongoDB scripts (`watch.py`, `manager.py`, the legacy path of `launch
 | Docker with Compose | any recent | the bundled PostgreSQL and the lab (optional) |
 | Subfinder | optional | the `subfinder` discovery source |
 
-macOS and Linux are supported.
+macOS and Linux are supported, and Windows through WSL2. For the Windows steps, see the [README](../README.md#setup-on-windows-wsl).
 
 ## 1. Install the package
 
 ```bash
-git clone https://github.com/OmidRahmanian/Watchtower.git
-cd Watchtower
+git clone https://github.com/OmidRahmanian/Devil-Eyes.git
+cd Devil-Eyes
 python3 -m venv .venv
 . .venv/bin/activate
 python -m pip install -e '.[api]'
@@ -114,8 +114,10 @@ WATCHTOWER__NOTIFICATIONS__DESTINATIONS='[{"name": "ops", "kind": "discord", "ur
 ## 6. Dashboard and API
 
 ```bash
-watchtower serve            # http://127.0.0.1:8080, sign in with your token
+watchtower serve            # http://127.0.0.1:8080
 ```
+
+With the `development` profile, the dashboard opens without a token in a browser on the same computer, and you can add targets from it (**+ Add target**). Elsewhere, and on any server started with `--allow-remote`, sign in with a token. `python terminal_ui.py --dashboard` starts the same server together with a scan worker and, when AI review is enabled, an AI worker, so work queued from the dashboard runs without a separate worker. The Windows `Start-Dashboard.cmd` uses this.
 
 The server listens on loopback only unless you pass `--host` with `--allow-remote`. Put TLS in front of it before exposing it. The API is described in [api.md](api.md), and its OpenAPI document is at `/api/v1/openapi.json`.
 

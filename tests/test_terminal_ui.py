@@ -337,17 +337,54 @@ def test_separate_window_environment_finds_installed_tools(client):
 def test_dashboard_waits_for_readiness_before_opening_browser(client, monkeypatch):
     monkeypatch.setattr(ui, "dashboard_state", Mock(side_effect=["unavailable", "unavailable", "unavailable", "ready"]))
     server = Mock()
-    server.poll.side_effect = [None, None, 0]
+    server.poll.side_effect = [None, None, 0, 0]
     server.wait.return_value = 0
     monkeypatch.setattr(ui.subprocess, "Popen", Mock(return_value=server))
     sleep = Mock()
     monkeypatch.setattr(ui.time, "sleep", sleep)
     browse = Mock()
     monkeypatch.setattr(ui, "open_dashboard_browser", browse)
+    processor = Mock(error=None)
+    monkeypatch.setattr(ui, "LocalProcessor", Mock(return_value=processor))
+    monkeypatch.setattr(ui, "ai_enabled", lambda client: False)
+    ai_processor = Mock()
+    monkeypatch.setattr(ui, "AiProcessor", ai_processor)
     assert ui.serve_dashboard(client, browse=True) == 0
+    ai_processor.assert_not_called()
     browse.assert_called_once_with(client)
     sleep.assert_called_once()
     server.terminate.assert_not_called()
+    # Scans queued from the dashboard are processed by this window, then the worker shuts down with it.
+    processor.start.assert_called_once()
+    processor.close.assert_called_once()
+
+
+def test_dashboard_reports_a_stopped_scan_worker_and_keeps_serving(client, monkeypatch, capsys):
+    monkeypatch.setattr(ui, "dashboard_state", Mock(side_effect=["unavailable", "unavailable", "ready"]))
+    server = Mock()
+    server.poll.side_effect = [None, None, None, 0, 0]
+    server.wait.return_value = 0
+    monkeypatch.setattr(ui.subprocess, "Popen", Mock(return_value=server))
+    monkeypatch.setattr(ui.time, "sleep", Mock())
+    processor = Mock(error="OperationalError")
+    monkeypatch.setattr(ui, "LocalProcessor", Mock(return_value=processor))
+    monkeypatch.setattr(ui, "ai_enabled", lambda client: True)
+    ai_processor = Mock(error="Model missing")
+    monkeypatch.setattr(ui, "AiProcessor", Mock(return_value=ai_processor))
+    assert ui.serve_dashboard(client) == 0
+    out = capsys.readouterr().out
+    assert out.count("Scan worker stopped (OperationalError)") == 1
+    assert out.count("AI worker stopped (Model missing)") == 1
+    server.terminate.assert_not_called()
+    processor.close.assert_called_once()
+    ai_processor.start.assert_called_once()
+    ai_processor.close.assert_called_once()
+
+
+def test_dashboard_ai_switch_failure_never_stops_the_dashboard(client, monkeypatch):
+    import watchtower.config
+    monkeypatch.setattr(watchtower.config, "load_settings", Mock(side_effect=ValueError("bad [ai] section")))
+    assert ui.ai_enabled(client) is False
 
 
 def test_dashboard_startup_failure_does_not_open_browser(client, monkeypatch):
@@ -357,9 +394,12 @@ def test_dashboard_startup_failure_does_not_open_browser(client, monkeypatch):
     monkeypatch.setattr(ui.subprocess, "Popen", Mock(return_value=server))
     browse = Mock()
     monkeypatch.setattr(ui, "open_dashboard_browser", browse)
+    processor = Mock()
+    monkeypatch.setattr(ui, "LocalProcessor", processor)
     with pytest.raises(ui.UiError, match="exited"):
         ui.serve_dashboard(client, browse=True)
     browse.assert_not_called()
+    processor.assert_not_called()
 
 
 def test_dashboard_interrupt_reaps_owned_server(client, monkeypatch):

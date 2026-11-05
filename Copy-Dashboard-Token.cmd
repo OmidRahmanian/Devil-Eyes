@@ -1,5 +1,7 @@
 @echo off
-wsl.exe -d Ubuntu-24.04 -- /home/omid/.local/share/watchtower/app/.venv/bin/python /home/omid/.local/share/watchtower/dashboard-token.py
+rem Only needed to sign in from another device; on this PC the dashboard opens without a token.
+if not defined DEVILS_EYES_DISTRO set DEVILS_EYES_DISTRO=Ubuntu-24.04
+wsl.exe -d %DEVILS_EYES_DISTRO% --cd ~ -- .local/share/watchtower/app/.venv/bin/python .local/share/watchtower/app/deploy/windows/dashboard-token.py
 if errorlevel 1 goto failed
 pause
 exit /b 0

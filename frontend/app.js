@@ -10,7 +10,7 @@ const TOKEN_KEY = "watchtower.token";
 const PROJECT_KEY = "watchtower.project";
 const REFRESH_MS = 10000;
 
-const state = { token: null, projects: [], project: null, view: "overview", timer: null, cursor: {}, filters: {}, scanKey: null };
+const state = { token: null, local: false, projects: [], project: null, view: "overview", timer: null, cursor: {}, filters: {}, scanKey: null };
 
 // ---- small DOM helpers -------------------------------------------------
 
@@ -92,7 +92,8 @@ async function api(path, options = {}) {
   const response = await fetch(API + path, {
     method: options.method || "GET",
     headers: {
-      Authorization: `Bearer ${state.token}`,
+      // The open local dashboard sends no token; the server knows this computer.
+      ...(state.token ? { Authorization: `Bearer ${state.token}` } : {}),
       ...(options.body ? { "Content-Type": "application/json" } : {}),
     },
     body: options.body ? JSON.stringify(options.body) : undefined,
@@ -114,6 +115,11 @@ async function api(path, options = {}) {
 
 function projectPath(suffix) {
   return `/projects/${encodeURIComponent(state.project.id)}${suffix}`;
+}
+
+// A token session, or the open local dashboard on this computer.
+function signedIn() {
+  return Boolean(state.token) || state.local;
 }
 
 function can(permission) {
@@ -140,7 +146,8 @@ async function signIn(token) {
   button.textContent = "Signing in…";
   state.token = token;
   try {
-    state.projects = await api("/projects");
+    // Archived projects are finished with; they never appear in the dashboard.
+    state.projects = (await api("/projects")).filter((p) => !p.archived);
   } catch (error) {
     state.token = null;
     storage("remove", TOKEN_KEY);
@@ -158,47 +165,112 @@ async function signIn(token) {
     return;
   }
   storage("set", TOKEN_KEY, token);
+  enter();
+}
+
+// On this computer the server can open the dashboard without a token.
+async function openLocally() {
+  try {
+    const response = await fetch(API + "/projects", { credentials: "omit", cache: "no-store" });
+    if (!response.ok) return false;
+    state.local = true;
+    state.projects = (await response.json()).filter((p) => !p.archived);
+  } catch (_) {
+    return false;
+  }
+  enter();
+  return true;
+}
+
+function enter() {
   const remembered = storage("get", PROJECT_KEY);
-  state.project = state.projects.find((p) => p.id === remembered) || state.projects[0];
-  const select = document.getElementById("project");
-  select.replaceChildren(...state.projects.map((p) =>
-    el("option", { value: p.id, selected: p.id === state.project.id }, `${p.name} (${p.role})`)));
+  state.project = state.projects.find((p) => p.id === remembered) || state.projects[0] || null;
+  fillProjects();
   document.getElementById("signin").hidden = true;
   document.getElementById("nav").hidden = false;
   document.getElementById("view").hidden = false;
+  document.getElementById("signout").hidden = state.local;
   notice("");
-  show("overview");
+  show(...routeOf(location.hash));
 }
 
 function signOut(message) {
   storage("remove", TOKEN_KEY);
   state.token = null;
+  state.local = false;
   state.project = null;
   clearInterval(state.timer);
   document.getElementById("signin").hidden = false;
   document.getElementById("nav").hidden = true;
   document.getElementById("view").hidden = true;
   document.getElementById("view").replaceChildren();
+  if (typeof cosmosReset === "function") cosmosReset();
   notice(message || "", message ? "warn" : "");
+}
+
+function fillProjects() {
+  const select = document.getElementById("project");
+  select.hidden = !state.projects.length;
+  select.replaceChildren(...state.projects.map((p) =>
+    el("option", { value: p.id, selected: Boolean(state.project) && p.id === state.project.id }, `${p.name} (${p.role})`)));
+}
+
+function useProject(id) {
+  const project = state.projects.find((p) => p.id === id);
+  if (!project || project === state.project) return;
+  state.project = project;
+  storage("set", PROJECT_KEY, project.id);
+  state.cursor = {};
+  document.getElementById("project").value = project.id;
 }
 
 // ---- views -------------------------------------------------------------
 
 const views = {};
 
+// Each view has a linkable hash, so reloads and browser Back/Forward work.
+function hashFor(view, arg) {
+  if (view === "overview") return "#/universe";
+  if (view === "target") return `#/target/${encodeURIComponent(arg.projectId)}/${encodeURIComponent(arg.root)}`;
+  return `#/${view}` + (typeof arg === "string" ? `/${encodeURIComponent(arg)}` : "");
+}
+
+function routeOf(hash) {
+  let parts;
+  try {
+    parts = hash.replace(/^#\/?/, "").split("/").map(decodeURIComponent);
+  } catch (_) {
+    return ["overview"];
+  }
+  if (parts[0] === "target" && parts.length >= 3) return ["target", { projectId: parts[1], root: parts.slice(2).join("/") }];
+  if (parts[0] && parts[0] !== "universe" && Object.hasOwn(views, parts[0])) return [parts[0], parts[1] || undefined];
+  return ["overview"];
+}
+
 async function show(view, arg) {
+  if (!state.project && view !== "overview") {
+    // Every other view belongs to a project; an empty universe has none yet.
+    notice("Add a target first: it creates your first project.", "warn");
+    view = "overview";
+    arg = undefined;
+  }
+  const previous = state.view;
   state.view = view;
   clearInterval(state.timer);
+  const hash = hashFor(view, arg);
+  if (location.hash !== hash) history.pushState(null, "", hash);
   for (const button of document.querySelectorAll("#nav button[data-view]")) {
     button.classList.toggle("active", button.dataset.view === view);
   }
   const root = document.getElementById("view");
+  await cosmosBefore(previous, view, arg);
   try {
     await views[view](root, arg);
   } catch (error) {
     if (error.status !== 401) notice(error.message, "bad");
   }
-  if (["overview", "runs", "alerts"].includes(view)) {
+  if (state.view === view) cosmosAfter(previous, view);
+  if (["summary", "runs", "alerts"].includes(view) && state.view === view) {
     // The monitoring views follow live state.
     state.timer = setInterval(() => views[view](root, arg).catch(() => {}), REFRESH_MS);
   }
@@ -225,13 +297,13 @@ function runRow(run) {
     el("td", { class: "error" }, run.last_error || ""));
 }
 
-views.overview = async (root) => {
+views.summary = async (root) => {
   const data = await api(projectPath("/overview"));
   const counts = data.counts;
   const open = counts.findings_by_status.open + counts.findings_by_status.triaged + (counts.findings_by_status.in_progress || 0);
   const pending = data.rules.filter((r) => !r.approved);
   root.replaceChildren(
-    heading(data.project.name),
+    heading(`${data.project.name}: project summary`, el("button", { class: "quiet", onclick: () => show("overview") }, "Back to universe")),
     data.scope
       ? el("div", { class: "panel" },
         el("h2", {}, `Authorized scope: revision ${data.scope.number}`),
@@ -262,22 +334,20 @@ function tile(label, value, kind) {
     el("div", { class: "label" }, label));
 }
 
+async function startRun(body, after) {
+  try {
+    state.scanKey = state.scanKey || crypto.randomUUID();
+    const run = await api(projectPath("/runs"), { method: "POST", body: { reason: "started from dashboard", ...body,
+      idempotency_key: state.scanKey, reuse_active: true } });
+    state.scanKey = null;
+    notice(`Queued run ${run.run_id.slice(0, 8)}.`, "ok");
+    after();
+  } catch (error) { notice(error.message, "bad"); }
+}
+
 views.runs = async (root) => {
   const page = await api(projectPath("/runs?limit=50"));
-  const start = can("operate")
-    ? el("button", {
-      onclick: async () => {
-        try {
-          state.scanKey = state.scanKey || crypto.randomUUID();
-          const run = await api(projectPath("/runs"), { method: "POST", body: { reason: "started from dashboard",
-            idempotency_key: state.scanKey, reuse_active: true } });
-          state.scanKey = null;
-          notice(`Queued run ${run.run_id.slice(0, 8)}.`, "ok");
-          show("runs");
-        } catch (error) { notice(error.message, "bad"); }
-      },
-    }, "Start run")
-    : null;
+  const start = can("operate") ? el("button", { onclick: () => startRun({}, () => show("runs")) }, "Start run") : null;
   root.replaceChildren(heading("Runs", start),
     tableOf(["Run", "Kind", "Status", "Created", "Phases", "Error"], page.items.map(runRow), "No runs yet."));
 };
@@ -302,15 +372,19 @@ function describeChange(change) {
   return `${kind} ${key}: ${show(before)} -> ${show(after)}`;
 }
 
-views.alerts = async (root) => {
-  const page = await api(projectPath("/alerts?limit=50"));
-  root.replaceChildren(heading("Alerts"), page.items.length
-    ? el("ul", { class: "feed" }, page.items.map((alert) => el("li", {},
+function alertFeed(alerts, empty) {
+  return alerts.length
+    ? el("ul", { class: "feed" }, alerts.map((alert) => el("li", {},
       el("div", {}, badge(alert.event_type, alert.event_type === "monitor.run_failed" ? "bad" : "warn"), " ",
         when(alert.created_at), ` to ${alert.channel} (${alert.status})`,
         alert.last_error ? el("span", { class: "error" }, ` ${alert.last_error}`) : null),
       el("ul", {}, (alert.payload.changes || []).slice(0, 50).map((c) => el("li", { class: "mono" }, describeChange(c)))))))
-    : el("p", { class: "empty" }, "No alerts yet."));
+    : el("p", { class: "empty" }, empty);
+}
+
+views.alerts = async (root) => {
+  const page = await api(projectPath("/alerts?limit=50"));
+  root.replaceChildren(heading("Alerts"), alertFeed(page.items, "No alerts yet."));
 };
 
 async function paged(root, title, path, render, headers, empty, controls = null) {
@@ -348,10 +422,9 @@ async function exportReport(dataset, format) {
   } catch (error) { notice(error.message, "bad"); }
 }
 
-views.assets = (root) => {
-  const filters = filtersFor("assets", ["search", "owner", "tag", "technology"]);
-  filters.form.append(el("button", { type: "button", onclick: () => exportReport("assets", "csv") }, "Export inventory CSV (up to 200)"));
-  return paged(root, "Inventory", "/assets?" + filters.query, (asset) => {
+const ASSET_HEADERS = ["Asset", "Kind", "Authorization", "Addresses", "HTTP", "Title", "Last seen"];
+
+function assetRow(asset) {
   const http = asset.last_http || {};
   return el("tr", {},
     el("td", { class: "mono" }, el("button", { onclick: () => show("asset", asset.id) }, asset.value)),
@@ -361,24 +434,34 @@ views.assets = (root) => {
     el("td", {}, text(http.status_code || http.outcome)),
     el("td", {}, text(http.title)),
     el("td", {}, when(asset.last_seen_at)));
-}, ["Asset", "Kind", "Authorization", "Addresses", "HTTP", "Title", "Last seen"], "No assets yet.", filters.form);
+}
+
+views.assets = (root) => {
+  const filters = filtersFor("assets", ["search", "owner", "tag", "technology"]);
+  filters.form.append(el("button", { type: "button", onclick: () => exportReport("assets", "csv") }, "Export inventory CSV (up to 200)"));
+  return paged(root, "Inventory", "/assets?" + filters.query, assetRow, ASSET_HEADERS, "No assets yet.", filters.form);
 };
+
+const FINDING_HEADERS = ["Severity", "Status", "Remediation", "Title", "Where", "Last seen"];
+
+function findingRow(finding) {
+  return el("tr", {
+    class: "link", tabindex: 0,
+    onclick: () => show("finding", finding.id),
+    onkeydown: (event) => { if (event.key === "Enter") show("finding", finding.id); },
+  },
+  el("td", {}, badge(finding.severity, SEVERITY[finding.severity])),
+  el("td", {}, finding.status),
+  el("td", {}, remediationBadge(finding.remediation)),
+  el("td", {}, finding.title),
+  el("td", { class: "mono" }, finding.target + finding.location),
+  el("td", {}, when(finding.last_seen_at)));
+}
 
 views.findings = (root) => {
   const filters = filtersFor("findings", ["severity", "confidence", "priority", "status", "owner"]);
   filters.form.append(el("button", { type: "button", onclick: () => exportReport("findings", "json") }, "Export findings JSON (up to 200)"));
-  return paged(root, "Findings", "/findings?" + filters.query, (finding) => el("tr", {
-  class: "link", tabindex: 0,
-  onclick: () => show("finding", finding.id),
-  onkeydown: (event) => { if (event.key === "Enter") show("finding", finding.id); },
-},
-el("td", {}, badge(finding.severity, SEVERITY[finding.severity])),
-el("td", {}, finding.status),
-el("td", {}, remediationBadge(finding.remediation)),
-el("td", {}, finding.title),
-el("td", { class: "mono" }, finding.target + finding.location),
-el("td", {}, when(finding.last_seen_at))),
-["Severity", "Status", "Remediation", "Title", "Where", "Last seen"], "No findings.", filters.form);
+  return paged(root, "Findings", "/findings?" + filters.query, findingRow, FINDING_HEADERS, "No findings.", filters.form);
 };
 
 views.finding = async (root, findingId) => {
@@ -501,17 +584,22 @@ views.candidates = (root) => paged(root, "Candidate provenance (ownership does n
   el("td", {}, JSON.stringify(asset.attributes.provenance || {}))),
 ["Candidate", "Ownership", "Authorization", "Sources"], "No candidates.");
 
-views.changes = (root) => paged(root, "Exposure changes", "/changes", (change) => {
+const CHANGE_HEADERS = ["When", "Target", "Phase", "Before / after", "Acknowledgement"];
+
+function changeRow(change, after) {
   const ack = change.acknowledgement;
   return el("tr", {}, el("td", {}, when(change.created_at)), el("td", {}, change.target), el("td", {}, change.phase),
     el("td", {}, el("pre", { class: "captured" }, JSON.stringify(change.changes, null, 2))),
     el("td", {}, ack ? `Acknowledged: ${ack.reason}` : can("operate") ? el("button", { onclick: async () => {
       const reason = window.prompt("Acknowledgement reason");
       if (!reason || !reason.trim()) return;
-      try { await api(projectPath(`/changes/${change.id}/acknowledge`), { method: "POST", body: { reason } }); show("changes"); }
+      try { await api(projectPath(`/changes/${change.id}/acknowledge`), { method: "POST", body: { reason } }); after(); }
       catch (error) { notice(error.message, "bad"); }
     } }, "Acknowledge") : "Unacknowledged"));
-}, ["When", "Target", "Phase", "Before / after", "Acknowledgement"], "No changes since baseline.");
+}
+
+views.changes = (root) => paged(root, "Exposure changes", "/changes", (change) => changeRow(change, () => show("changes")),
+  CHANGE_HEADERS, "No changes since baseline.");
 
 views.intelligence = async (root) => {
   const data = await api(projectPath("/intelligence?limit=50"));
@@ -530,8 +618,46 @@ views.settings = async (root) => {
   const data = await api(projectPath("/settings"));
   root.replaceChildren(heading("Settings and coverage"),
     el("p", { class: "hint" }, "Read-only effective configuration. Change profiles/environment and restart services to apply settings. Rule approval remains a reviewed manifest change."),
-    el("pre", { class: "captured" }, JSON.stringify(data, null, 2)));
+    el("pre", { class: "captured" }, JSON.stringify(data, null, 2)),
+    can("manage_project") ? el("div", { class: "panel danger" },
+      el("h2", {}, "Archive this project"),
+      el("p", {}, `Stops all scanning of ${state.project.name} for good and removes it, its targets (planets) and their assets `
+        + "from the dashboard and the terminal menus."),
+      el("p", { class: "hint" }, "Nothing is erased: the scan history and audit log are append-only and stay in the database, out of view. "
+        + "The dashboard cannot undo this."),
+      el("button", { class: "danger", onclick: archiveProject }, `Archive ${state.project.name}`)) : null);
 };
+
+async function archiveProject() {
+  const project = state.project;
+  const typed = window.prompt(`Archive ${project.name}? Type its slug "${project.slug}" to confirm.`);
+  if (typed === null) return;
+  if (typed.trim() !== project.slug) {
+    notice("The slug did not match, so nothing was archived.", "warn");
+    return;
+  }
+  if (await archiveNow(project)) notice(`Archived ${project.name}.`, "ok");
+}
+
+// Archives a confirmed project and moves on to the next one (or an empty universe).
+async function archiveNow(project) {
+  try {
+    await api(`/projects/${encodeURIComponent(project.id)}/archive`, { method: "POST", body: { confirm: project.slug } });
+  } catch (error) {
+    notice(error.message, "bad");
+    return false;
+  }
+  state.projects = state.projects.filter((p) => p.id !== project.id);
+  if (!state.projects.length && !state.local) {
+    signOut(`Archived ${project.name}. This token has no other projects: create a new one in the terminal (Projects, c).`);
+    return false;
+  }
+  state.project = null;
+  if (state.projects.length) useProject(state.projects[0].id);
+  fillProjects();
+  await show("overview");
+  return true;
+}
 
 function fact(label, value) {
   return [el("dt", {}, label), el("dd", {}, value)];
@@ -666,7 +792,7 @@ async function aiStart(kind) {
     if (kind === "collect") {
       if (!confirm("Collect in-scope pages and scripts for review? Third-party scripts are recorded, not fetched, and nothing is executed.")) return;
       const result = await api(projectPath("/ai/collections"), { method: "POST", body: { review: true } });
-      notice(`Collection run ${result.run.run_id.slice(0, 8)} queued; a review follows. An AI worker must be running.`, "ok");
+      notice(`Collection run ${result.run.run_id.slice(0, 8)} queued; a review follows. Both run in the dashboard window.`, "ok");
     } else {
       const status = await api(projectPath("/ai/status"));
       const result = await api(projectPath("/ai/reviews"), { method: "POST", body: { use_model: status.enabled } });
@@ -929,14 +1055,19 @@ document.addEventListener("DOMContentLoaded", () => {
   });
   document.getElementById("signout").addEventListener("click", () => signOut());
   document.getElementById("project").addEventListener("change", (event) => {
-    state.project = state.projects.find((p) => p.id === event.target.value);
-    storage("set", PROJECT_KEY, state.project.id);
-    state.cursor = {};
+    useProject(event.target.value);
+    state.focusProject = state.project.id;
     show("overview");
   });
   for (const button of document.querySelectorAll("#nav button[data-view]")) {
     button.addEventListener("click", () => show(button.dataset.view));
   }
-  const saved = storage("get", TOKEN_KEY);
-  if (saved) signIn(saved);
+  window.addEventListener("popstate", () => {
+    if (signedIn()) show(...routeOf(location.hash));
+  });
+  cosmosStart();
+  openLocally().then((opened) => {
+    const saved = storage("get", TOKEN_KEY);
+    if (!opened && saved) signIn(saved);
+  });
 });

@@ -6,6 +6,8 @@ Base path: `/api/v1`. The OpenAPI document is at `/api/v1/openapi.json`. Load it
 
 Every route except `/health` needs `Authorization: Bearer wt_<prefix>_<secret>`. Create tokens with `watchtower bootstrap` or `watchtower member add` ([installation.md](installation.md#3-create-a-project-and-its-owner)). Only a token's SHA-256 digest is stored.
 
+**Open on this PC.** When `auth.local_dashboard` is on (the `development` profile), a request without a token is accepted as the *local dashboard owner*, a principal that owns every active project. It applies only when all of these hold: the client address is loopback, the `Host` header names a loopback host (which blocks DNS rebinding), any `Origin` is exactly the server's own origin, and any `Sec-Fetch-Site` is `same-origin` or `none`. Everything else still needs a token. `watchtower serve --allow-remote` always turns this off. The owner's token is kept in `~/.config/watchtower/dashboard-owner-token` (mode 600), so the terminal can use the same projects.
+
 Project routes live under `/projects/{project_id}`. For each request the API resolves the token's role in that project, checks the permission the action needs, and reads through a project-scoped database transaction, so PostgreSQL row-level security confines it to that project.
 
 | Permission | Roles | Routes |
@@ -13,6 +15,7 @@ Project routes live under `/projects/{project_id}`. For each request the API res
 | `view` | viewer, operator, owner | every `GET`, `POST /scope/check` |
 | `operate` | operator, owner | `POST /runs`, `POST /runs/{id}/cancel`, `POST /findings/{id}/status`, `POST /findings/{id}/retest`, asset/finding `PATCH`, change acknowledgement and prioritization |
 | `manage_scope` | owner | `POST /scope`, `POST /scope/{revision}/revoke` |
+| `manage_project` | owner | `POST /archive` |
 
 Two cases return `404 not_found`, not `403`, so the API does not reveal which projects exist: a project you are not a member of, and a token restricted to a different project.
 
@@ -42,11 +45,13 @@ Listings return `{"items": [...], "next_cursor": "..." | null}`. Pass `cursor` a
 | --- | --- |
 | `GET /health` | liveness and version; no token needed |
 | `GET /projects` | the projects your token can use, with your role and permissions |
+| `POST /projects` | `{"name": ...}`; creates a project owned by the local dashboard owner. Only for the open-on-this-PC owner; tokens get `403` |
 | `GET /projects/{id}` | one project |
 | `GET /projects/{id}/overview` | current scope, totals, the latest runs, and each detection rule's approval state |
 | `GET /projects/{id}/scope` | the current revision and full history |
 | `POST /projects/{id}/scope` | publish a revision: `includes`, `excludes`, `permitted_ports`, `authorization {kind, reference, granted_by, valid_from?, valid_until?}`, and `attest_authorized: true` |
 | `POST /projects/{id}/scope/{revision}/revoke` | `{"reason": ...}` |
+| `POST /projects/{id}/archive` | `{"confirm": "<project slug>"}`; archives the project: every target is denied from then on and it leaves project lists. Nothing is deleted; its append-only history stays in the database. A wrong slug returns `409 request_conflict` |
 | `POST /projects/{id}/scope/check` | `{"target": ..., "port"?: ...}`; returns the decision and sends nothing |
 | `GET /projects/{id}/assets` | inventory; filter with `kind`, `search`, `owner`, `tag`, `technology` |
 | `GET /projects/{id}/assets/{asset}` | one asset with its recent observations |

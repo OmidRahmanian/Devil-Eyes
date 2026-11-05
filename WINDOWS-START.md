@@ -1,50 +1,48 @@
-# Running WatchTower on this Windows PC
+# Running Devils Eyes on Windows
 
-Installation completed in the existing Ubuntu-24.04 WSL2 distribution.
-Python 3.12, PostgreSQL 16, the platform/API/worker packages, and Subfinder
-are installed. Docker Desktop is not required for this installation.
+Devils Eyes runs inside Ubuntu on WSL2. You start it from Windows with the `.cmd` files in this folder. To install it, follow [Setup on Windows (WSL)](README.md#setup-on-windows-wsl) in the README.
 
-Double-click **Start-WatchTower.cmd** to open the guided terminal menu.
-The `local` project and owner account are already created. Choose **1 — Start
-scan**, paste a domain or website link, confirm your target permissions, and
-start. Saved domains and new targets are available in this same flow. Scans
-open a separate Windows terminal, leaving Home available; results are saved
-for later browsing.
+## Everyday use
 
-Double-click **Start-Dashboard.cmd** to start the web server and open
-http://localhost:8080. Keep its terminal window open while using the dashboard.
-The browser opens after the server is ready.
-Double-click **Copy-Dashboard-Token.cmd** to copy the private login token for
-the currently selected terminal project,
-then paste it into the dashboard's sign-in field. Ctrl+C stops the web server.
+| File | What it does |
+| --- | --- |
+| `Start-Dashboard.cmd` | Starts PostgreSQL, the dashboard, the scan worker and the AI worker, then opens http://localhost:8080. **Keep its window open**, because scans and AI reviews run in it. Ctrl+C stops it. |
+| `Start-WatchTower.cmd` | Opens the terminal menu (scans, progress, inventory, findings, continuous monitoring, AI review). |
+| `Copy-Dashboard-Token.cmd` | Copies a sign-in token to the clipboard. You only need it to open the dashboard from another device; on this PC it opens without signing in. |
 
-The start files start PostgreSQL automatically. Nothing scans until you
-publish scope. Shipped detection rules remain pending maintainer approval;
-the installation does not approve them. Notifications need your own optional
-destination credentials.
+The `.cmd` files use the WSL distribution `Ubuntu-24.04`. For another distribution, run `setx DEVILS_EYES_DISTRO "<name from wsl -l -v>"` once and open a new window.
 
-## Runtime and data
+## Where things live (inside WSL)
 
-The runtime is a separate Linux checkout of this repository at:
+| Path | Contents |
+| --- | --- |
+| `~/.local/share/watchtower/app` | The application, its `.venv` and its private `.env` |
+| `~/.local/share/watchtower/start.sh` | The entry point the `.cmd` files call (a copy of `deploy/windows/start.sh`) |
+| `~/.config/watchtower/` | Private tokens (mode 600) |
+| PostgreSQL data directory | All projects, scans, findings and AI reviews |
 
-`/home/omid/.local/share/watchtower/app`
+Back these up together.
 
-Its Python environment is `.venv`, configuration is `.env`, and evidence is
-under `data/` relative to that directory. The token is stored privately at
-`/home/omid/.config/watchtower/token`. PostgreSQL stores data in
-`/var/lib/postgresql/16/main`; the application uses a restricted
-`watchtower_local` role and database. Preserve these when backing up.
-
-Code edits to the Windows checkout do not automatically update the Linux
-runtime. Run code changes in the Linux checkout or intentionally update it
-before reinstalling packages and applying any new migrations.
-
-To run CLI commands from PowerShell:
+## Running CLI commands from PowerShell
 
 ```powershell
-wsl -d Ubuntu-24.04 -- bash /home/omid/.local/share/watchtower/start.sh status
-wsl -d Ubuntu-24.04 -- bash /home/omid/.local/share/watchtower/start.sh findings
+wsl -d Ubuntu-24.04 --cd ~ -- bash .local/share/watchtower/start.sh status
+wsl -d Ubuntu-24.04 --cd ~ -- bash .local/share/watchtower/start.sh --help
 ```
 
-The setup and token-copy helper scripts for this machine are included under
-`files/windows/`. Generated runtime files, credentials, and backups remain ignored.
+Any `watchtower` command works after `start.sh`, for example `start.sh findings`.
+
+## Updating
+
+Close the dashboard and terminal windows, then run this inside Ubuntu:
+
+```bash
+cd ~/.local/share/watchtower/app
+git pull
+.venv/bin/python -m pip install -e '.[api,workers]' -r requirements.txt
+set -a; . ./.env; set +a
+.venv/bin/watchtower-db upgrade
+cp deploy/windows/start.sh ~/.local/share/watchtower/start.sh
+```
+
+Then start the dashboard again and press **Ctrl+Shift+R** in the browser.

@@ -5,6 +5,10 @@ log_level = "DEBUG"
 [database]
 pool_size = 5
 
+[auth]
+# The dashboard opens without a token for browsers on this computer only.
+local_dashboard = true
+
 [scope]
 default_permitted_ports = "80,443"
 max_redirects = 0

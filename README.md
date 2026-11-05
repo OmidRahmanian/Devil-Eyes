@@ -1,33 +1,308 @@
-# WatchTower
+# Devils Eyes (WatchTower)
 <img width="1035" height="554" alt="image" src="https://github.com/user-attachments/assets/26764111-05c5-439a-b324-ef9a253f14f4" />
 
 **Keep watch over your attack surface as it changes.**
 
-WatchTower monitors authorized attack surfaces: discover subdomains, keep DNS and HTTP inventory, compare changes, investigate evidence and verify fixes through retests. The platform uses PostgreSQL, a CLI and dashboard, durable jobs and grouped alerts. The original MongoDB toolkit remains available as legacy discovery.
+Devils Eyes monitors the attack surface of domains you are **authorized** to test. It finds subdomains, keeps a DNS and HTTP inventory, compares every scan with the last one, alerts you about changes, and can ask a **local** AI model to review the pages and JavaScript it collected. Everything is stored in PostgreSQL and runs on your own machine.
 
-Use it to build an inventory of your targets, discover newly exposed services, and follow changes over time.
+You can use it in two ways, and they share the same data:
 
-## WatchTower platform
+- **The dashboard:** a 3D "universe" in your browser. The Devils Eye sits in the centre and every target domain is a planet. When a scan finds something new, a pulse travels from the eye to that planet. Click a planet to see its name, and click again to fly into its page: assets, findings, changes, alerts, scan history and the AI review.
+- **The terminal menu:** a guided menu for scans, progress, inventory, findings, continuous monitoring and the AI review.
 
-The platform is the new core of WatchTower. It keeps projects, authorized scope, inventory, findings and runs in PostgreSQL. Nothing is scanned until an owner publishes the scope they are authorized to test, together with the authorization behind it. It is operated from the `watchtower` CLI, the guided launcher, an HTTP API, or the dashboard.
+The Python package and command-line tools are called `watchtower`.
 
 ```mermaid
 flowchart LR
-    A[Owner publishes authorized scope] --> B[Run: discovery, DNS, HTTP, checks]
+    A[You add an authorized target] --> B[Scan: discovery, DNS, HTTP, checks]
     B --> C[(PostgreSQL: inventory, findings, evidence)]
-    B --> D[Grouped alerts]
-    C --> E[CLI / dashboard / API]
+    B --> D[Alerts and dashboard pulses]
+    C --> E[Dashboard / terminal / CLI / API]
+    C --> F[Optional local AI review]
     E -->|retest| B
 ```
 
-- **Try it with Docker only:** `lab/lab.sh demo` runs the whole journey against targets on an isolated network. See [lab/README.md](lab/README.md).
-- **Install it:** see [docs/installation.md](docs/installation.md).
-- **API:** see [docs/api.md](docs/api.md).
-- **Investigation, feeds, exports, request limits and retention:** see [docs/operations.md](docs/operations.md).
-- **Blueprint implementation map and remaining release gates:** see [docs/blueprint-coverage.md](docs/blueprint-coverage.md).
-- **Design and security boundaries:** [architecture](docs/architecture.md), [threat model](docs/threat-model.md), [private reporting](SECURITY.md).
-- **License:** [MIT](LICENSE); dependencies and external tools retain [their own licenses](THIRD_PARTY_NOTICES.md).
-- **What it covers, what it does not, and how each step is tested:** see [docs/coverage.md](docs/coverage.md).
+## Contents
+
+- [What you need](#what-you-need)
+- [Setup on Windows (WSL)](#setup-on-windows-wsl)
+- [Setup on Linux or macOS](#setup-on-linux-or-macos)
+- [Using Devils Eyes](#using-devils-eyes)
+- [Optional: AI review with a local model](#optional-ai-review-with-a-local-model)
+- [Setting it up with an AI assistant](#setting-it-up-with-an-ai-assistant)
+- [Safety rules built in](#safety-rules-built-in)
+- [Troubleshooting](#troubleshooting)
+- [Documentation](#documentation)
+- [Project layout](#project-layout)
+- [Legacy discovery](#legacy-discovery)
+
+## What you need
+
+| Component | Version | Used for |
+| --- | --- | --- |
+| Python | 3.11 or newer | the application |
+| PostgreSQL | 16 or 17 | all data |
+| Git | any | getting the code |
+| [Subfinder](https://github.com/projectdiscovery/subfinder) | latest release | finding subdomains from passive sources |
+| [Ollama](https://ollama.com) with a model | optional | the AI review |
+| Docker with Compose | optional | an alternative way to run PostgreSQL, and the [demo lab](lab/README.md) |
+
+Supported systems: **Windows 10/11 through WSL2 (Ubuntu)**, **Linux** and **macOS**.
+
+> **Just want to look first?** With only Docker installed, `lab/lab.sh demo` runs the whole journey against test targets on an isolated network. See [lab/README.md](lab/README.md).
+
+## Setup on Windows (WSL)
+
+On Windows, Devils Eyes runs inside Ubuntu on WSL2. You start it from Windows with the `.cmd` files in this repository.
+
+### 1. Install Ubuntu on WSL
+
+Open **PowerShell as Administrator**:
+
+```powershell
+wsl --install -d Ubuntu-24.04
+```
+
+Restart if asked, open **Ubuntu** from the Start menu, and create your Linux user name and password.
+
+> The `.cmd` files use the distribution `Ubuntu-24.04`. If yours has another name (see `wsl -l -v`), set it once in PowerShell: `setx DEVILS_EYES_DISTRO "Ubuntu"`.
+
+### 2. Install the system packages
+
+Inside the **Ubuntu** terminal:
+
+```bash
+sudo apt update
+sudo apt install -y git python3 python3-venv python3-pip postgresql unzip curl
+sudo service postgresql start
+```
+
+### 3. Get the code
+
+The Windows start files expect the app at `~/.local/share/watchtower/app`:
+
+```bash
+mkdir -p ~/.local/share/watchtower
+git clone https://github.com/OmidRahmanian/Devil-Eyes.git ~/.local/share/watchtower/app
+cd ~/.local/share/watchtower/app
+```
+
+### 4. Install the application
+
+```bash
+python3 -m venv .venv
+.venv/bin/python -m pip install --upgrade pip
+.venv/bin/python -m pip install -e '.[api,workers]' -r requirements.txt
+```
+
+### 5. Create the database
+
+This creates a private database user with a random password and saves the connection in `.env`. `.env` is ignored by Git, so the password never reaches the repository.
+
+```bash
+PASS=$(python3 -c 'import secrets; print(secrets.token_hex(32))')
+sudo -u postgres psql -v ON_ERROR_STOP=1 -d postgres <<SQL
+CREATE ROLE watchtower LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOBYPASSRLS PASSWORD '$PASS';
+CREATE DATABASE watchtower OWNER watchtower;
+REVOKE ALL ON DATABASE watchtower FROM PUBLIC;
+GRANT CONNECT, TEMPORARY ON DATABASE watchtower TO watchtower;
+SQL
+sudo -u postgres psql -v ON_ERROR_STOP=1 -d watchtower -c 'REVOKE CREATE ON SCHEMA public FROM PUBLIC; ALTER SCHEMA public OWNER TO watchtower;'
+
+umask 077
+printf 'WATCHTOWER__DATABASE__URL=postgresql+psycopg://watchtower:%s@127.0.0.1:5432/watchtower\nWATCHTOWER_PROFILE=development\n' "$PASS" > .env
+unset PASS
+
+set -a; . ./.env; set +a
+.venv/bin/watchtower-db upgrade
+```
+
+The application deliberately connects as a normal user, not a superuser. That keeps PostgreSQL's row-level security active, so each request only sees its own project.
+
+### 6. Install Subfinder
+
+Download the latest `subfinder_*_linux_amd64.zip` from the [Subfinder releases page](https://github.com/projectdiscovery/subfinder/releases), check it against the release's `checksums.txt`, and put the binary into the app's environment:
+
+```bash
+cd ~/.local/share/watchtower/app
+unzip -o ~/subfinder_*_linux_amd64.zip subfinder -d .venv/bin/   # adjust the path to where you saved the zip
+chmod 700 .venv/bin/subfinder
+.venv/bin/subfinder -version
+```
+
+If you have Go installed, `go install -v github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest` also works, as long as `subfinder` ends up on your `PATH`.
+
+### 7. Install the start script
+
+```bash
+cp ~/.local/share/watchtower/app/deploy/windows/start.sh ~/.local/share/watchtower/start.sh
+bash ~/.local/share/watchtower/start.sh status
+```
+
+`status` should answer without errors. It is fine if it says that no project exists yet.
+
+### 8. Start it from Windows
+
+Clone or download this repository on Windows too, or copy just the three `.cmd` files somewhere handy, such as your Desktop:
+
+| File | What it does |
+| --- | --- |
+| `Start-Dashboard.cmd` | Starts PostgreSQL, the dashboard, the scan worker and the AI worker, then opens http://localhost:8080. **Keep its window open:** scans and AI reviews run in it. |
+| `Start-WatchTower.cmd` | Opens the terminal menu. |
+| `Copy-Dashboard-Token.cmd` | Copies a sign-in token. Only needed to open the dashboard from **another** device. |
+
+Double-click **`Start-Dashboard.cmd`**. The dashboard opens without signing in, and you can add your first target. See [Using Devils Eyes](#using-devils-eyes).
+
+## Setup on Linux or macOS
+
+```bash
+git clone https://github.com/OmidRahmanian/Devil-Eyes.git
+cd Devil-Eyes
+python3 -m venv .venv
+.venv/bin/python -m pip install --upgrade pip
+.venv/bin/python -m pip install -e '.[api,workers]' -r requirements.txt
+```
+
+**PostgreSQL:** on Linux, install the `postgresql` package and run the same commands as in [Windows step 5](#5-create-the-database). On macOS, or if you prefer Docker, use the bundled container:
+
+```bash
+cp deploy/.env.example deploy/.env      # then replace every password in it
+docker compose -f deploy/compose.yaml --env-file deploy/.env up -d postgres
+umask 077
+printf 'WATCHTOWER__DATABASE__URL=postgresql+psycopg://watchtower:<WATCHTOWER_DB_PASSWORD from deploy/.env>@127.0.0.1:5432/watchtower\nWATCHTOWER_PROFILE=development\n' > .env
+```
+
+Then apply the schema:
+
+```bash
+set -a; . ./.env; set +a
+.venv/bin/watchtower-db upgrade
+```
+
+**Subfinder:** install it from its [releases page](https://github.com/projectdiscovery/subfinder/releases) (or `brew install subfinder` on macOS) so that `subfinder` is on your `PATH`.
+
+**Start it:**
+
+```bash
+set -a; . ./.env; set +a
+export PATH="$PWD/.venv/bin:$PATH"
+python terminal_ui.py --dashboard --open-browser   # dashboard + scan and AI workers; keep it running
+python launcher.py --platform                      # the terminal menu, in a second terminal
+```
+
+More detail, including roles, tokens, notifications and production deployment, is in [docs/installation.md](docs/installation.md).
+
+## Using Devils Eyes
+
+### Add a target (dashboard)
+
+1. Open the dashboard (`Start-Dashboard.cmd`, or http://localhost:8080 while it runs).
+2. Click **+ Add target**.
+3. Enter a domain or website link, for example `example.com`.
+4. Choose **A new project for this target** (its own planet), or add it to an existing project.
+5. Tick **Also discover and scan all of its subdomains** if you want `*.example.com` too.
+6. Fill in **who granted you permission** (a contract, bug bounty program, or your own ownership) and tick the confirmation box.
+7. Leave **Start a scan now** ticked and click **Add target**.
+
+A new planet forms. Its scan starts within a few seconds in the dashboard window, and the planet pulses as assets are found. You can add as many targets as you like.
+
+Each scan works through **discovery** (subdomains, from passive sources), **dns**, **http** (which hosts serve websites) and **checks** (the vulnerability rules).
+
+To **remove** a target, open its planet and use **Remove this target** at the bottom of its page. Removed targets are **archived**, never erased, because the history is kept on purpose.
+
+### The terminal menu
+
+Open it with `Start-WatchTower.cmd`, or with `python launcher.py --platform`.
+
+| Key | Menu item |
+| --- | --- |
+| `1` | **Start scan:** scan once, or set up **continuous monitoring** on a schedule |
+| `2` | **View scan progress:** watch, resume or cancel a run |
+| `3` / `4` | Browse inventory / findings |
+| `5` | Advanced target settings (scope) |
+| `6` | Alerts |
+| `7` | Open the dashboard |
+| `8` | Switch project |
+| `a` | AI security review |
+
+The terminal works on one project at a time. Press `8` to choose which one.
+
+### The dashboard on other devices
+
+On the computer that runs it, the dashboard opens without signing in. Requests from other devices, and from other websites in your browser, are refused. To use it from another device, start the server with `watchtower serve --host 0.0.0.0 --allow-remote` behind TLS, and sign in with a token (`Copy-Dashboard-Token.cmd`). See [docs/installation.md](docs/installation.md#6-dashboard-and-api).
+
+## Optional: AI review with a local model
+
+The AI review is **off by default** and never uses an online AI service. It reads what Devils Eyes collected for a target (pages, headers, in-scope JavaScript) and asks a model running on **your** machine for possible security issues. Every suggestion has to quote the exact code it is based on, and the quotes are verified. Suggestions never become findings on their own.
+
+1. Install [Ollama](https://ollama.com) and a model, for example `ollama pull qwen3:8b-q4_K_M` (about 5 GB; fits an 8 GB GPU).
+2. Make the model reachable from Devils Eyes. On Windows with WSL, see [the networking options](docs/ai-review.md#2-reaching-the-model-from-ubuntu-on-wsl).
+3. Turn it on in `.env`:
+
+   ```bash
+   WATCHTOWER__AI__ENABLED=true
+   WATCHTOWER__AI__MODEL=qwen3:8b-q4_K_M
+   # Only when Ollama runs on the Windows host rather than inside Ubuntu:
+   WATCHTOWER__AI__ENDPOINT=http://windows-host:11434
+   WATCHTOWER__AI__ALLOW_PRIVATE_ENDPOINT=true
+   ```
+
+4. Restart the dashboard. Its window then says *"AI worker running"*.
+5. Once you have added a target, check the connection on the dashboard's **AI Review → Model status and Advanced** page, or in the terminal under **`a` → `7` Model status**. It should say **READY**.
+
+To use it, open the dashboard's **AI Review** page, or the terminal's **`a`** menu:
+
+- **Collect scripts for review:** downloads the in-scope pages and scripts, then reviews them. This is the useful one.
+- **Review latest scan:** reviews only what the scan stored (URLs, titles, a few headers), so it often finds nothing.
+
+Full details are in [docs/ai-review.md](docs/ai-review.md).
+
+## Setting it up with an AI assistant
+
+If you would rather have an AI coding assistant do the setup, point it at **[AI-SETUP.md](AI-SETUP.md)**. That file is a step-by-step guideline written for an assistant: the order of the steps, how to verify each one, and what it must ask you before doing.
+
+## Safety rules built in
+
+- **Nothing is scanned without an authorized scope.** Adding a target records who authorized it, and every request is checked against that scope first.
+- **Loopback, link-local, cloud metadata and reserved addresses are always refused.** Private networks are refused unless a profile explicitly allows them.
+- **The vulnerability rules ship switched off.** The five detection rules in `rules/` only run after a maintainer approves them by pinning their hashes ([rules/README.md](rules/README.md)). Until then, scans still map subdomains, DNS and websites, but finish as **partial** and report no findings.
+- **A finding is only resolved by a conclusive negative retest.** Failed or partial scans never count as a fix.
+- **Secrets stay local.** Database passwords, tokens and webhook URLs live in `.env` or private files (mode 600), which Git ignores.
+- **History is kept.** Projects and targets are archived, not deleted.
+
+Only scan systems you own or have written permission to test. For bug bounty programs, follow each program's rules on automated scanning and rate limits.
+
+## Troubleshooting
+
+| Problem | What to do |
+| --- | --- |
+| The dashboard shows an old page | Press **Ctrl+Shift+R** to reload without the cache. |
+| A scan stays **queued** | The dashboard window must be open, because it runs the scans. Or run one from the terminal: `2` (View scan progress), then `3` (Open processing window). |
+| `Port 8080 is occupied` | A dashboard is already running. Use it, or close the other window first. |
+| `could not connect to server` / database errors | Start PostgreSQL: `sudo service postgresql start`. `Start-*.cmd` does this for you. |
+| Scans finish as **partial** | Expected while the detection rules await approval. See [Safety rules built in](#safety-rules-built-in). |
+| The AI review says **Unreachable** or **Model missing** | Start Ollama, then look at **Model status**. See [docs/ai-review.md](docs/ai-review.md#troubleshooting-connection-check). |
+| The AI review finds nothing | Use **Collect scripts for review** after the scan has finished. A plain review only sees URLs and titles. |
+| WSL distribution not found | `setx DEVILS_EYES_DISTRO "<name from wsl -l -v>"`, then open a new window. |
+
+## Documentation
+
+| Topic | Document |
+| --- | --- |
+| Full installation, roles, tokens, notifications | [docs/installation.md](docs/installation.md) |
+| Terminal menu | [docs/terminal.md](docs/terminal.md) |
+| AI review | [docs/ai-review.md](docs/ai-review.md) |
+| HTTP API | [docs/api.md](docs/api.md) |
+| Investigation, feeds, exports, request limits, retention | [docs/operations.md](docs/operations.md) |
+| What a scan covers, and what it does not | [docs/coverage.md](docs/coverage.md) |
+| Architecture and threat model | [docs/architecture.md](docs/architecture.md), [docs/threat-model.md](docs/threat-model.md) |
+| Reporting a vulnerability | [SECURITY.md](SECURITY.md) |
+| Setup guideline for AI assistants | [AI-SETUP.md](AI-SETUP.md) |
+| Licence | [MIT](LICENSE); dependencies keep [their own licences](THIRD_PARTY_NOTICES.md) |
+
+### Command line
+
+Everything the menus do is also available from the `watchtower` CLI:
 
 ```bash
 watchtower scope publish --include example.com --include '*.example.com' \
@@ -38,13 +313,38 @@ watchtower finding retest <id> --watch --work
 watchtower serve                     # dashboard at http://127.0.0.1:8080
 ```
 
-A finding is resolved only by a conclusive negative retest of its own check against its own endpoint. Failed and inconclusive retests, and failed or partial scans, are shown as such and never count as a fix. The shipped detection rules run only after a maintainer approves them ([rules/README.md](rules/README.md)).
+### Running the tests
+
+```bash
+.venv/bin/python -m pip install -e '.[dev]' -r requirements.txt
+docker run -d --name wt-test-pg -e POSTGRES_PASSWORD=postgres -p 127.0.0.1:55432:5432 postgres:17-alpine
+WATCHTOWER_TEST_DATABASE_URL=postgresql://postgres:postgres@127.0.0.1:55432/postgres .venv/bin/python -m pytest
+```
+
+Without `WATCHTOWER_TEST_DATABASE_URL`, the database tests are skipped.
+
+## Project layout
+
+| Path | Role |
+| --- | --- |
+| `src/watchtower/` | The application: domain, persistence, services, workers, API (`api/`) and CLI (`cli.py`) |
+| `frontend/` | The dashboard. Plain JavaScript with no build step; `frontend/universe/` is the 3D view, and `frontend/vendor/` holds the pinned Three.js |
+| `terminal_ui.py`, `launcher.py` | The terminal menu and the launcher that opens it |
+| `Start-*.cmd`, `Copy-Dashboard-Token.cmd`, `deploy/windows/` | The Windows start files and their WSL helper scripts |
+| `config/profiles/` | Settings profiles (`development`, `production`, `lab`, `test`) |
+| `migrations/` | Database schema migrations (`watchtower-db upgrade`) |
+| `rules/` | Detection rules and their maintainer-approved manifest |
+| `deploy/` | Docker Compose files for PostgreSQL and workers |
+| `lab/` | The isolated demonstration lab |
+| `docs/` | Documentation |
+| `tests/` | Automated tests |
+| `watch.py`, `start.py`, `manager.py`, `*.json` | The legacy MongoDB toolkit (below) |
 
 ## Legacy discovery
 
-The rest of this README describes the original MongoDB toolkit. It still works on its own, alongside the platform.
+The rest of this README describes the original MongoDB toolkit. It is separate from everything above and still works on its own. New users do not need it.
 
-## What it does
+### What it does
 
 - **Discover subdomains** with Subfinder, certificate transparency data from crt.sh, and SecurityTrails.
 - **Resolve discovered names** with ShuffleDNS and wordlists, including integrations for DNSGen, Altdns, and AlterX.
@@ -68,7 +368,7 @@ flowchart LR
     F --> H[Terminal manager / exports]
 ```
 
-## Interactive setup
+### Interactive setup
 
 Start the guided terminal interface:
 
@@ -94,7 +394,7 @@ This setup selects one target and disables other discovery jobs and Nuclei scans
 
 Docker and Subfinder must already be installed. Install Python dependencies once with `.venv/bin/python -m pip install -r requirements.txt` after creating the virtual environment described below. The launcher supports macOS and Linux.
 
-## Requirements
+### Requirements
 
 WatchTower uses Python, MongoDB, and external command-line tools. Install the tools needed by the jobs you enable and make sure they are available on your `PATH`.
 
@@ -112,20 +412,20 @@ WatchTower uses Python, MongoDB, and external command-line tools. Install the to
 
 SecurityTrails also requires an API key. DNS jobs require a resolver list at `~/.resolvers`, a static wordlist at `wordlist/static.txt`, and, for dynamic resolution, a permutation wordlist at `wordlist/gen_alt.txt`. Supply these files before enabling the corresponding jobs.
 
-## Manual setup
+### Manual setup
 
-### 1. Install Python dependencies
+#### 1. Install Python dependencies
 
 ```bash
-git clone https://github.com/OmidRahmanian/Watchtower.git
-cd Watchtower
+git clone https://github.com/OmidRahmanian/Devil-Eyes.git
+cd Devil-Eyes
 python3 -m venv .venv
 source .venv/bin/activate
 python -m pip install -r requirements.txt
 mkdir -p files export output wordlist
 ```
 
-### 2. Start MongoDB
+#### 2. Start MongoDB
 
 ```bash
 docker compose up -d mongodb
@@ -133,7 +433,7 @@ docker compose up -d mongodb
 
 If your installation provides the standalone Compose command, use `docker-compose up -d mongodb`.
 
-### 3. Configure notifications
+#### 3. Configure notifications
 
 For manual setup, create a local `.env` file with your credentials. `./run.sh` loads it automatically; load it into your shell before running the Python backend directly.
 
@@ -174,7 +474,7 @@ set +a
 
 `.env` is ignored by Git. Keep real webhook URLs, bot tokens, and API keys in that local file.
 
-### 4. Set your targets
+#### 4. Set your targets
 
 Replace the sample domains in `targets.json` with your own scope:
 
@@ -191,7 +491,7 @@ Replace the sample domains in `targets.json` with your own scope:
 
 `targets.json` drives recurring monitoring. `starttargets.json` supplies domains for the separate initial collection script. The `out_of_scope` checks compare exact subdomain strings; they do not expand wildcard patterns.
 
-### 5. Choose your jobs
+#### 5. Choose your jobs
 
 Edit `setting.json` to enable integrations you have configured. Each recurring job has a `status`, a numeric `value`, and a `time` unit such as `hours`, `days`, or `weeks`:
 
@@ -209,7 +509,7 @@ The sample intervals schedule Subfinder, crt.sh, and SecurityTrails every three 
 
 Additional settings control notifications, HTTP change comparisons, scanning new assets, and the Nuclei command arguments.
 
-### 6. Run WatchTower
+#### 6. Run WatchTower
 
 From the project directory, with the virtual environment active and credentials loaded:
 
@@ -227,7 +527,7 @@ python -u start.py
 
 `start.py` runs its collection pipeline immediately, including SecurityTrails, and requires that pipeline's dependencies and API key. After a successful run, it merges those targets into `targets.json`.
 
-## Manage findings
+### Manage findings
 
 Open the terminal manager in another shell:
 
@@ -238,32 +538,7 @@ python manager.py
 
 The menu supports exporting discovered, resolved, and HTTP assets; searching by subdomain, status code, technology, or title; querying records; editing targets; and updating settings. Exports are written to `export/`.
 
-## Project layout
-
-| File or directory | Role |
-| --- | --- |
-| `src/watchtower/` | The platform package: domain, persistence, services, workers, API (`api/`) and CLI (`cli.py`) |
-| `frontend/` | The dashboard served by `watchtower serve` |
-| `lab/` | The isolated demonstration lab |
-| `docs/` | Installation, API and coverage documentation |
-| `rules/` | Detection rules and their pinned, maintainer-approved manifest |
-| `launcher.py` | Interactive setup for the platform or legacy discovery, with the banner |
-| `session.py` | Prevents overlapping monitoring and setup sessions |
-| `run.sh` | Starts the backend with local environment credentials |
-| `requirements.txt` | Python dependencies |
-| `watch.py` | Recurring monitoring scheduler and notification integrations |
-| `start.py` | Initial collection pipeline |
-| `manager.py` | Interactive terminal manager |
-| `setting.json` | Job intervals, feature switches, and scan options |
-| `targets.json` | Recurring monitoring scope |
-| `starttargets.json` | Initial collection scope |
-| `docker-compose.yml` | MongoDB service and persistent storage |
-| `wordlist/` | User-supplied DNS wordlists |
-| `files/` | Working files |
-| `export/` | Exported inventories |
-| `data/` | Local MongoDB storage and backup paths |
-
-## Operational notes
+### Legacy operational notes
 
 WatchTower is an early version that coordinates external tools. Check each enabled integration with your installed tool versions before relying on unattended monitoring.
 

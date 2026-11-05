@@ -4,11 +4,19 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="referrer" content="no-referrer">
+  <meta name="color-scheme" content="dark">
+  <link rel="icon" href="data:,">
   <title>Devils Eyes</title>
   <link rel="stylesheet" href="/static/app.css">
   <script src="/static/app.js" defer></script>
+  <script src="/static/cosmos.js" defer></script>
+  <script src="/static/target-page.js" defer></script>
+  <script src="/static/add-target.js" defer></script>
 </head>
 <body>
+  <div id="cosmos" class="cosmos" aria-hidden="true"></div>
+  <div id="flood" class="flood" aria-hidden="true" hidden></div>
+
   <header class="bar">
     <div class="brand"><span class="eye" aria-hidden="true">&lt;((|@|))&gt;</span> Devils Eyes</div>
     <nav id="nav" class="nav" hidden>
@@ -29,13 +37,13 @@
   </header>
 
   <main id="main">
-    <section id="signin" class="panel narrow">
+    <section id="signin" class="panel glass narrow">
       <h1>Sign in</h1>
       <p>Run <strong>Copy-Dashboard-Token.cmd</strong> in your Windows project folder, then paste the copied token below.</p>
       <form id="signin-form">
         <label for="token">API token</label>
         <input id="token" type="password" autocomplete="off" spellcheck="false" placeholder="wt_xxxxxxxx_..." required>
-        <button type="submit">Sign in</button>
+        <button type="submit" class="primary">Sign in</button>
       </form>
       <p class="hint">The helper copies the token for your selected terminal project. Your token stays in this browser tab. You can also paste an existing API token.</p>
     </section>

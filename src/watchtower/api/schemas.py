@@ -124,6 +124,14 @@ class RevokeScopeIn(_In):
     reason: str = Field(min_length=3, max_length=2000)
 
 
+class CreateProjectIn(_In):
+    name: str = Field(min_length=1, max_length=200)
+
+
+class ArchiveProjectIn(_In):
+    confirm: str = Field(min_length=1, max_length=63)  # the project's slug, typed by the owner
+
+
 class ScopeCheckIn(_In):
     target: str = Field(min_length=1, max_length=2048)
     port: int | None = Field(default=None, ge=1, le=65535)

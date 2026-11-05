@@ -803,7 +803,11 @@ def cmd_serve(app: App, args: argparse.Namespace) -> int:
 
     if args.host not in ("127.0.0.1", "::1", "localhost") and not args.allow_remote:
         raise CliError("refusing to listen beyond loopback without --allow-remote (put TLS in front of it)")
-    uvicorn.run(create_app(app.database, settings=app.settings, scope=app.scope), host=args.host, port=args.port,
+    settings = app.settings
+    if args.allow_remote:
+        # Reachable from other machines: every request must carry a token.
+        settings = settings.model_copy(update={"auth": settings.auth.model_copy(update={"local_dashboard": False})})
+    uvicorn.run(create_app(app.database, settings=settings, scope=app.scope), host=args.host, port=args.port,
                 log_level=app.settings.log_level.lower(), proxy_headers=False, server_header=False)
     return 0
 

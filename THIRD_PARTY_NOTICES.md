@@ -19,6 +19,7 @@ Metadata observed in the development environment for this build:
 | Celery | BSD-3-Clause |
 | Uvicorn | BSD-3-Clause |
 | pytest (test dependency) | MIT |
+| three.js 0.170.0 (vendored in `frontend/vendor/`, license in `three.LICENSE.txt`) | MIT |
 
 Transitive dependencies, optional legacy requirements, Docker base images,
 PostgreSQL, RabbitMQ, nginx and firewall packages carry their own notices.
