@@ -2,9 +2,9 @@ name: CI
 
 on:
   push:
-    branches: [firstversion, "integration/**", "agent/**", "coord/**"]
+    branches: [main, firstversion, "integration/**", "agent/**", "coord/**"]
   pull_request:
-    branches: [integration/exposure-platform, firstversion]
+    branches: [main, integration/exposure-platform, firstversion]
 
 permissions:
   contents: read
@@ -67,8 +67,15 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
-      - name: Dashboard script parses
-        run: node --check frontend/app.js
+      - name: Dashboard scripts parse
+        run: |
+          for f in frontend/*.js; do node --check "$f"; done
+          # The universe view is ES modules; .mjs makes node parse them as modules.
+          mkdir -p "$RUNNER_TEMP/universe"
+          for f in frontend/universe/*.js; do
+            cp "$f" "$RUNNER_TEMP/universe/$(basename "$f" .js).mjs"
+            node --check "$RUNNER_TEMP/universe/$(basename "$f" .js).mjs"
+          done
       - name: Lab scripts parse
         run: sh -n lab/lab.sh && sh -n lab/targets/start-web.sh
       - name: Lab compose file is valid
